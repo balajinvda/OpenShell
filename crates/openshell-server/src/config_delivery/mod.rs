@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use metrics::counter;
+use metrics::{counter, histogram};
 use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
     ConfigComponent, PeerConfigProviderTarget, PeerConfigSandboxTarget,
@@ -494,27 +494,29 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
         outcome: BuildOutcome::Failed,
         owner_moved: false,
     };
+    let started = Instant::now();
     let built =
         tokio::time::timeout(build_timeout(key.component), build_component(state, key)).await;
+    let elapsed = started.elapsed();
     let (message, require_acknowledgement, providers) = match built {
         Ok(Ok(Some(built))) => built,
         Ok(Ok(None)) => {
-            record_build(key.component, *lane, "ok");
+            record_build(key.component, *lane, "ok", elapsed);
             return BuildResult {
                 outcome: BuildOutcome::Built { providers: None },
                 owner_moved: false,
             };
         }
         Ok(Err(error)) => {
-            record_build_failure(key, *lane, "failed", error.code());
+            record_build_failure(key, *lane, "failed", error.code(), elapsed);
             return failed;
         }
         Err(_) => {
-            record_build_failure(key, *lane, "timeout", Code::DeadlineExceeded);
+            record_build_failure(key, *lane, "timeout", Code::DeadlineExceeded, elapsed);
             return failed;
         }
     };
-    record_build(key.component, *lane, "ok");
+    record_build(key.component, *lane, "ok", elapsed);
     let owner_moved = match owner_check(state, &key.sandbox_id, session_id).await {
         OwnerCheck::Current => {
             let disposition = state.supervisor_sessions.deliver_config(
@@ -554,6 +556,12 @@ const fn build_timeout(component: ConfigComponentKind) -> Duration {
     }
 }
 
+#[tracing::instrument(
+    name = "config_build",
+    level = "debug",
+    skip_all,
+    fields(otel.name = "config_delivery.build", sandbox_id = %key.sandbox_id, component = key.component.name())
+)]
 async fn build_component(
     state: &Arc<ServerState>,
     key: &DeliveryKey,
@@ -922,7 +930,12 @@ pub fn register_test_apply_session(
     }
 }
 
-fn record_build(component: ConfigComponentKind, lane: Lane, outcome: &'static str) {
+fn record_build(
+    component: ConfigComponentKind,
+    lane: Lane,
+    outcome: &'static str,
+    elapsed: Duration,
+) {
     counter!(
         "openshell_supervisor_config_builds_total",
         "component" => component.name(),
@@ -930,10 +943,22 @@ fn record_build(component: ConfigComponentKind, lane: Lane, outcome: &'static st
         "outcome" => outcome,
     )
     .increment(1);
+    histogram!(
+        crate::gateway_metrics::SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+        "component" => component.name(),
+        "outcome" => outcome,
+    )
+    .record(elapsed.as_secs_f64());
 }
 
-fn record_build_failure(key: &DeliveryKey, lane: Lane, outcome: &'static str, error_code: Code) {
-    record_build(key.component, lane, outcome);
+fn record_build_failure(
+    key: &DeliveryKey,
+    lane: Lane,
+    outcome: &'static str,
+    error_code: Code,
+    elapsed: Duration,
+) {
+    record_build(key.component, lane, outcome, elapsed);
     warn!(
         sandbox_id = %key.sandbox_id,
         component = key.component.name(),

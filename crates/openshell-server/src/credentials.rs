@@ -646,6 +646,12 @@ impl CredentialRuntime {
             .await
     }
 
+    #[tracing::instrument(
+        name = "credentials",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "credentials.resolve_provider_handles")
+    )]
     pub async fn resolve_provider_handles(
         &self,
         provider: &Provider,
