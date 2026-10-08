@@ -334,6 +334,10 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::{OpaEngine, PolicyGenerationGuard};
 use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::skills;
+use openshell_supervisor_process::supervisor_session::{
+    ConfigApplyRequest, config_admission, config_apply_result, provider_config_revision,
+    sandbox_config_revision,
+};
 use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracker};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
@@ -836,31 +840,29 @@ async fn run_sandbox_with_backend(
     let uses_stream_configuration = prepared_supervisor_session.as_ref().is_some_and(
         openshell_supervisor_process::supervisor_session::PreparedSupervisorSession::uses_stream_configuration,
     );
-    // A gateway that keeps polling authoritative must not see this session
-    // until the workload is running. Close it and reconnect after startup, as
-    // polling supervisors always have.
+    // A polling gateway has already accepted this session, but a legacy
+    // gateway marks the sandbox ready as soon as it accepts one, and
+    // SessionAccepted does not say which kind this is. Close the session and
+    // reconnect once the workload runs, as polling supervisors always have.
     if !uses_stream_configuration {
         prepared_supervisor_session = None;
     }
 
-    if stream_bootstrap
-        .as_ref()
-        .is_some_and(|bootstrap| bootstrap.sandbox_config.is_none())
-    {
-        return Err(miette::miette!(
-            "supervisor bootstrap omitted required sandbox configuration"
-        ));
-    }
-    if uses_stream_configuration
-        && stream_bootstrap
-            .as_ref()
-            .and_then(|bootstrap| bootstrap.sandbox_config.as_ref())
-            .is_some_and(|snapshot| snapshot.policy.is_none())
-    {
-        return Err(miette::miette!(
-            "supervisor bootstrap omitted required sandbox policy"
-        ));
-    }
+    let initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult> =
+        match stream_bootstrap.as_ref() {
+            Some(bootstrap) => Some(
+                bootstrap
+                    .sandbox_config
+                    .clone()
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "supervisor bootstrap omitted required sandbox configuration"
+                        )
+                    })?
+                    .into(),
+            ),
+            None => None,
+        };
     let vm_policy_identity = selected_backend.vm_policy_identity();
 
     // Load policy and initialize OPA engine
@@ -885,9 +887,7 @@ async fn run_sandbox_with_backend(
         LocalPolicyIdentity::Required,
         vm_policy_identity,
         Some(image_discovery),
-        stream_bootstrap
-            .as_ref()
-            .and_then(|bootstrap| bootstrap.sandbox_config.clone()),
+        initial_stream_snapshot.clone(),
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
         },
@@ -909,7 +909,9 @@ async fn run_sandbox_with_backend(
             .as_ref()
             .and_then(|bootstrap| bootstrap.provider_environment.clone())
     {
-        let result: openshell_core::grpc_client::ProviderEnvironmentResult = snapshot.into();
+        // Polling startup fails the same way on an invalid provider response.
+        let result = openshell_core::grpc_client::ProviderEnvironmentResult::try_from(snapshot)
+            .wrap_err("supervisor bootstrap delivered an invalid provider environment")?;
         let degraded = result.readiness_reason != ProviderReadinessReason::Unspecified;
         let credentials = initial_provider_credentials(result, &provider_readiness);
         (credentials, degraded)
@@ -975,53 +977,61 @@ async fn run_sandbox_with_backend(
         (credentials, false)
     };
 
+    // The bootstrap already initialized the runtime. Report what startup
+    // installed before the workload starts.
     let mut prepared_bootstrap_result = stream_bootstrap.as_ref().map(|bootstrap| {
-        use openshell_core::proto::{ConfigApplyOutcome, ConfigBootstrapResult, ConfigComponent};
-        let mut results = Vec::with_capacity(2);
-        let mut admission = None;
-        if let Some(snapshot) = bootstrap.provider_environment.as_ref() {
+        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
+
+        let provider = bootstrap.provider_environment.as_ref().map(|snapshot| {
             let revision = provider_config_revision(snapshot.provider_env_revision);
             let outcome = if provider_bootstrap_degraded {
                 ConfigApplyOutcome::Degraded
             } else {
                 ConfigApplyOutcome::Applied
             };
-            results.push(config_apply_result(
+            config_apply_result(
                 ConfigComponent::ProviderEnvironment,
-                revision.clone(),
+                Some(revision.clone()),
                 Some(revision),
                 outcome,
                 None,
-            ));
-        }
-        if let Some(snapshot) = bootstrap.sandbox_config.as_ref() {
-            let settings: openshell_core::grpc_client::SettingsPollResult = snapshot.clone().into();
-            let revision = sandbox_config_revision(&settings);
-            let outcome = if !snapshot.configuration_admitted {
-                ConfigApplyOutcome::FailedClosed
-            } else if loaded_policy_origin.allows_gateway_policy_reload() {
-                ConfigApplyOutcome::Applied
+            )
+        });
+        let sandbox = initial_stream_snapshot.as_ref().map(|snapshot| {
+            let revision = sandbox_config_revision(snapshot);
+            let result = if snapshot.configuration_admitted {
+                // Unreachable middleware leaves the policy enforced with only
+                // built-in middleware until the runtime connects it.
+                let outcome =
+                    if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
+                        ConfigApplyOutcome::Applied
+                    } else {
+                        ConfigApplyOutcome::Degraded
+                    };
+                config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    Some(revision.clone()),
+                    Some(revision),
+                    outcome,
+                    None,
+                )
             } else {
-                ConfigApplyOutcome::RetainedLocalOverride
-            };
-            let applied_revision =
-                matches!(outcome, ConfigApplyOutcome::Applied).then_some(revision.clone());
-            results.push(config_apply_result(
-                ConfigComponent::SandboxConfig,
-                revision,
-                applied_revision,
-                outcome,
-                (!snapshot.configuration_admitted).then(|| {
-                    (
+                config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    Some(revision),
+                    None,
+                    ConfigApplyOutcome::FailedClosed,
+                    Some((
                         "configuration_rejected",
-                        snapshot.configuration_error.clone(),
+                        &snapshot.configuration_error,
                         true,
-                    )
-                }),
-            ));
-            admission = Some(streamed_configuration_admission(snapshot, true));
-        }
-        ConfigBootstrapResult { results, admission }
+                    )),
+                )
+            };
+            let admission = config_admission(snapshot, config_apply_result_activates(&result));
+            (result, admission)
+        });
+        bootstrap_result(provider, sandbox, true)
     });
 
     if credential_gating_unavailable(
@@ -1301,9 +1311,8 @@ async fn run_sandbox_with_backend(
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
-        let initial_stream_configuration_admitted = stream_bootstrap
+        let initial_stream_configuration_admitted = initial_stream_snapshot
             .as_ref()
-            .and_then(|bootstrap| bootstrap.sandbox_config.as_ref())
             .is_none_or(|snapshot| snapshot.configuration_admitted);
         let poll_endpoint_policy = (loaded_policy_origin.allows_gateway_policy_reload()
             && initial_stream_configuration_admitted)
@@ -1338,10 +1347,7 @@ async fn run_sandbox_with_backend(
                 substrate_ready: transparent_tcp_substrate_ready,
             },
             config_apply_rx: config_apply_rx.take(),
-            initial_stream_snapshot: stream_bootstrap
-                .as_ref()
-                .and_then(|bootstrap| bootstrap.sandbox_config.clone())
-                .map(Into::into),
+            initial_stream_snapshot,
             config_apply_enabled: Some(config_apply_enabled),
             endpoint_observation_tx,
             endpoint_status_rx,
@@ -1425,7 +1431,7 @@ async fn run_sandbox_with_backend(
             agent.clone(),
             Some(supervisor_session_updates),
             prestarted_supervisor_session,
-            Some(config_apply_tx),
+            config_apply_tx,
             ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
@@ -2339,6 +2345,7 @@ impl VmPolicyIdentity {
     }
 }
 
+#[derive(Clone)]
 struct CapturedProviderEnvironment {
     credentials: ProviderCredentialState,
     expires_at_ms: Option<i64>,
@@ -2349,6 +2356,11 @@ impl CapturedProviderEnvironment {
     fn install(self, readiness: &ProviderReadinessTracker) -> ProviderCredentialState {
         readiness.credentials_installed(self.identity, &self.credentials, self.expires_at_ms);
         self.credentials
+    }
+
+    /// Validate the environment's bindings without touching live credentials.
+    fn prepare(provider: &openshell_core::grpc_client::ProviderEnvironmentResult) -> Result<Self> {
+        prepare_provider_environment(provider).map(|credentials| Self::new(credentials, provider))
     }
 
     fn new(
@@ -2418,7 +2430,7 @@ async fn load_policy_with_gateway(
     local_policy_identity: LocalPolicyIdentity,
     vm_identity: Option<VmPolicyIdentity>,
     image_discovery: Option<ImagePolicyDiscovery>,
-    initial_snapshot: Option<openshell_core::proto::SandboxConfigSnapshot>,
+    initial_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
     gateway: &impl StartupGateway,
 ) -> Result<(
     SandboxPolicy,
@@ -2506,7 +2518,7 @@ async fn load_policy_with_gateway(
         return Box::pin(load_stream_bootstrap_policy(
             id,
             endpoint,
-            snapshot.into(),
+            snapshot,
             extension_credentials,
             vm_identity,
         ))
@@ -2775,67 +2787,14 @@ async fn load_policy_with_gateway(
                 };
             let engine = Arc::new(engine);
 
-            // Install the in-process catalog before any external connection can
-            // fail. A newly started sandbox must always be able to resolve built-in
-            // bindings, even while operator-run services are unavailable.
-            install_builtin_middleware_registry(&engine).await?;
-
-            // Connect operator-registered middleware services. A connect/describe
-            // failure keeps the built-in registry active so each request's
-            // `on_error` policy governs matched traffic. The policy poll loop
-            // retries the install without waiting for a config change.
-            let middleware_services = snapshot.supervisor_middleware_services.clone();
-            let middleware_registry_status = if middleware_services.is_empty() {
-            MiddlewareRegistryStatus::Synchronized
-        } else if let Err(error) = grpc_retry("Middleware connect", || {
-            let middleware_services = middleware_services.clone();
-            let extension_credentials = extension_credentials.clone();
-            let extension_authentication_enabled = snapshot.extension_authentication_enabled;
-            async move {
-                let credentials = if extension_authentication_enabled {
-                    // Share the supervisor's store so the slots installed here
-                    // are the ones the policy poll loop later rotates in place.
-                    openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-                        endpoint,
-                        extension_credentials,
-                    )
-                    .await?
-                    .refresh_extension_credentials(&middleware_services)
-                    .await?
-                } else {
-                    std::collections::HashMap::new()
-                };
-                connect_middleware_registry(
-                    &middleware_services,
-                    &MiddlewareAuthentication {
-                        credentials,
-                        enabled: extension_authentication_enabled,
-                    },
-                )
-                .await
-            }
-        })
-        .await
-        .and_then(|registry| engine.replace_middleware_registry(registry))
-        {
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .state(StateId::Other, "degraded")
-                    .unmapped(
-                        "supervisor_middleware_service_count",
-                        serde_json::json!(middleware_services.len())
-                    )
-                    .message(format!(
-                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
-                    ))
-                    .build()
-            );
-            MiddlewareRegistryStatus::NeedsReconciliation
-        } else {
-            MiddlewareRegistryStatus::Synchronized
-        };
+            let middleware_registry_status = connect_startup_middleware(
+                &engine,
+                endpoint,
+                &snapshot.supervisor_middleware_services,
+                snapshot.extension_authentication_enabled,
+                extension_credentials,
+            )
+            .await?;
             let opa_engine = Some(engine);
 
             // The gateway compares the entire tuple again. A concurrent repair or
@@ -2967,47 +2926,21 @@ async fn load_stream_bootstrap_policy(
             .wrap_err("failed to install required sandbox policy from supervisor bootstrap")?,
     );
 
-    // Install the in-process catalog before any external connection can fail.
-    install_builtin_middleware_registry(&engine).await?;
     let extension_authentication_enabled =
         snapshot.extension_authentication_enabled && !configuration_rejected;
-    let middleware_services = if configuration_rejected {
-        Vec::new()
+    let middleware_services: &[_] = if configuration_rejected {
+        &[]
     } else {
-        snapshot.supervisor_middleware_services.clone()
+        &snapshot.supervisor_middleware_services
     };
-    if !middleware_services.is_empty() {
-        let registry = grpc_retry("Middleware connect", || {
-            let middleware_services = middleware_services.clone();
-            let extension_credentials = extension_credentials.clone();
-            async move {
-                let credentials = if extension_authentication_enabled {
-                    // Share the supervisor's store so the slots installed here
-                    // are the ones the policy poll loop later rotates in place.
-                    openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-                        endpoint,
-                        extension_credentials,
-                    )
-                    .await?
-                    .refresh_extension_credentials(&middleware_services)
-                    .await?
-                } else {
-                    std::collections::HashMap::new()
-                };
-                connect_middleware_registry(
-                    &middleware_services,
-                    &MiddlewareAuthentication {
-                        credentials,
-                        enabled: extension_authentication_enabled,
-                    },
-                )
-                .await
-            }
-        })
-        .await
-        .wrap_err("failed to install required middleware runtime from supervisor bootstrap")?;
-        engine.replace_middleware_registry(registry)?;
-    }
+    let middleware_registry_status = connect_startup_middleware(
+        &engine,
+        endpoint,
+        middleware_services,
+        extension_authentication_enabled,
+        extension_credentials,
+    )
+    .await?;
 
     let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
         Ok(policy) => policy,
@@ -3020,7 +2953,7 @@ async fn load_stream_bootstrap_policy(
         policy,
         Some(engine),
         Some(proto_policy),
-        MiddlewareRegistryStatus::Synchronized,
+        middleware_registry_status,
         LoadedPolicyOrigin::Gateway {
             revision: loaded_policy_revision,
             has_last_valid_policy,
@@ -3029,6 +2962,72 @@ async fn load_stream_bootstrap_policy(
         extension_authentication_enabled,
         None,
     ))
+}
+
+/// Install the startup middleware registry.
+///
+/// The in-process catalog is installed before any external connection can
+/// fail, so a newly started sandbox can always resolve built-in bindings. A
+/// failure to connect operator-registered services keeps that registry
+/// active, so each request's `on_error` policy governs matched traffic, and
+/// the runtime retries the install without waiting for a config change.
+async fn connect_startup_middleware(
+    engine: &OpaEngine,
+    endpoint: &str,
+    middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    extension_authentication_enabled: bool,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
+) -> Result<MiddlewareRegistryStatus> {
+    install_builtin_middleware_registry(engine).await?;
+    if middleware_services.is_empty() {
+        return Ok(MiddlewareRegistryStatus::Synchronized);
+    }
+    let connected = grpc_retry("Middleware connect", || {
+        let extension_credentials = extension_credentials.clone();
+        async move {
+            let credentials = if extension_authentication_enabled {
+                // Share the supervisor's store so the slots installed here
+                // are the ones the policy poll loop later rotates in place.
+                openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+                    endpoint,
+                    extension_credentials,
+                )
+                .await?
+                .refresh_extension_credentials(middleware_services)
+                .await?
+            } else {
+                std::collections::HashMap::new()
+            };
+            connect_middleware_registry(
+                middleware_services,
+                &MiddlewareAuthentication {
+                    credentials,
+                    enabled: extension_authentication_enabled,
+                },
+            )
+            .await
+        }
+    })
+    .await
+    .and_then(|registry| engine.replace_middleware_registry(registry));
+    let Err(error) = connected else {
+        return Ok(MiddlewareRegistryStatus::Synchronized);
+    };
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .state(StateId::Other, "degraded")
+            .unmapped(
+                "supervisor_middleware_service_count",
+                serde_json::json!(middleware_services.len())
+            )
+            .message(format!(
+                "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+            ))
+            .build()
+    );
+    Ok(MiddlewareRegistryStatus::NeedsReconciliation)
 }
 
 /// Capture the policy from the workload filesystem, preserving invalid input
@@ -3276,6 +3275,16 @@ enum GatewayRuntimeFailureClass {
     PolicyValidation,
     TransparentTcpPrerequisite,
     MiddlewareRegistry,
+}
+
+impl std::fmt::Display for GatewayRuntimeReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PolicyValidation(error)
+            | Self::TransparentTcpPrerequisite(error)
+            | Self::MiddlewareRegistry(error) => error.fmt(f),
+        }
+    }
 }
 
 impl GatewayRuntimeReloadError {
@@ -4032,14 +4041,11 @@ struct PolicyPollLoopContext {
     middleware_connector: MiddlewareConnector,
     /// Immutable driver capability and startup substrate state.
     transparent_tcp: TransparentTcpReloadState,
-    config_apply_rx: Option<
-        tokio::sync::mpsc::Receiver<
-            openshell_supervisor_process::supervisor_session::ConfigApplyRequest,
-        >,
-    >,
-    /// Present for revision-2 sessions. The bootstrap already initialized
-    /// runtime state, so this seeds equality tracking and disables fetch-based
-    /// reconciliation for the current protocol.
+    /// Payloads delivered over the supervisor session.
+    config_apply_rx: Option<tokio::sync::mpsc::Receiver<ConfigApplyRequest>>,
+    /// Present when the session delivered a bootstrap. It already initialized
+    /// the runtime, so it seeds the applied trackers and the runtime applies
+    /// delivered updates instead of polling.
     initial_stream_snapshot: Option<openshell_core::grpc_client::SettingsPollResult>,
     /// Whether the current supervisor session delivers configuration
     /// authoritatively. A stream-started runtime polls while it is false.
@@ -4431,65 +4437,11 @@ fn emit_policy_validation_failure(
 }
 
 async fn receive_config_apply(
-    receiver: &mut Option<
-        tokio::sync::mpsc::Receiver<
-            openshell_supervisor_process::supervisor_session::ConfigApplyRequest,
-        >,
-    >,
-) -> Option<openshell_supervisor_process::supervisor_session::ConfigApplyRequest> {
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<ConfigApplyRequest>>,
+) -> Option<ConfigApplyRequest> {
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
-    }
-}
-
-fn sandbox_config_revision(
-    snapshot: &openshell_core::grpc_client::SettingsPollResult,
-) -> openshell_core::proto::ConfigSnapshotRevision {
-    openshell_core::proto::ConfigSnapshotRevision {
-        component: Some(
-            openshell_core::proto::config_snapshot_revision::Component::SandboxConfig(
-                openshell_core::proto::SandboxConfigRevision {
-                    config_revision: snapshot.config_revision,
-                    policy_version: snapshot.version,
-                    policy_source: snapshot.policy_source.into(),
-                    global_policy_version: snapshot.global_policy_version,
-                    settings_revision: snapshot.settings_revision,
-                },
-            ),
-        ),
-    }
-}
-
-fn provider_config_revision(revision: u64) -> openshell_core::proto::ConfigSnapshotRevision {
-    openshell_core::proto::ConfigSnapshotRevision {
-        component: Some(
-            openshell_core::proto::config_snapshot_revision::Component::ProviderEnvironment(
-                revision,
-            ),
-        ),
-    }
-}
-
-fn config_apply_result(
-    component: openshell_core::proto::ConfigComponent,
-    requested_revision: openshell_core::proto::ConfigSnapshotRevision,
-    applied_revision: Option<openshell_core::proto::ConfigSnapshotRevision>,
-    outcome: openshell_core::proto::ConfigApplyOutcome,
-    failure: Option<(&str, String, bool)>,
-) -> openshell_core::proto::ConfigComponentApplyResult {
-    openshell_core::proto::ConfigComponentApplyResult {
-        component: component.into(),
-        requested_revision: Some(requested_revision),
-        applied_revision,
-        outcome: outcome.into(),
-        failure: failure.map(|(code, message, retryable)| {
-            openshell_core::proto::ConfigApplyFailure {
-                code: code.to_string(),
-                message: message.chars().take(1024).collect(),
-                retryable,
-            }
-        }),
     }
 }
 
@@ -4507,39 +4459,51 @@ fn config_apply_result_activates(
     )
 }
 
-fn streamed_configuration_admission(
-    snapshot: &openshell_core::proto::SandboxConfigSnapshot,
-    runtime_applied: bool,
-) -> openshell_core::proto::SandboxConfigurationAdmission {
-    use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+fn is_awaiting_component(result: &openshell_core::proto::ConfigComponentApplyResult) -> bool {
+    result.outcome == i32::from(openshell_core::proto::ConfigApplyOutcome::AwaitingComponent)
+}
 
-    let accepted = snapshot.configuration_admitted && runtime_applied;
-    SandboxConfigurationAdmission {
-        instance_id: snapshot.configuration_instance_id.clone(),
-        state: if accepted {
-            ConfigurationAdmissionState::Accepted.into()
-        } else {
-            ConfigurationAdmissionState::Rejected.into()
-        },
-        policy_version: snapshot.version,
-        policy_hash: snapshot.policy_hash.clone(),
-        config_revision: snapshot.config_revision,
-        provider_env_revision: snapshot.provider_env_revision,
-        error: if accepted {
-            String::new()
-        } else if snapshot.configuration_error.is_empty() {
-            "effective configuration could not be activated".to_string()
-        } else {
-            snapshot.configuration_error.clone()
-        },
+/// A provider snapshot staged for its sandbox configuration is applied once
+/// that configuration activates with it.
+fn provider_applied_with_sandbox(
+    provider: openshell_core::proto::ConfigComponentApplyResult,
+    sandbox: &openshell_core::proto::ConfigComponentApplyResult,
+    provider_consumed: bool,
+) -> openshell_core::proto::ConfigComponentApplyResult {
+    if is_awaiting_component(&provider)
+        && provider_consumed
+        && config_apply_result_activates(sandbox)
+    {
+        config_apply_result(
+            openshell_core::proto::ConfigComponent::ProviderEnvironment,
+            provider.requested_revision.clone(),
+            provider.requested_revision,
+            openshell_core::proto::ConfigApplyOutcome::Applied,
+            None,
+        )
+    } else {
+        provider
     }
 }
 
-#[derive(Debug)]
-struct PendingStreamProvider {
-    identity: EnvironmentIdentity,
-    credentials: ProviderCredentialState,
-    expires_at_ms: Option<i64>,
+/// Session result for a bootstrap, from its component results.
+fn bootstrap_result(
+    provider: Option<openshell_core::proto::ConfigComponentApplyResult>,
+    sandbox: Option<(
+        openshell_core::proto::ConfigComponentApplyResult,
+        openshell_core::proto::SandboxConfigurationAdmission,
+    )>,
+    provider_consumed: bool,
+) -> openshell_core::proto::ConfigBootstrapResult {
+    let (sandbox, admission) = sandbox.unzip();
+    let provider = provider.map(|provider| match sandbox.as_ref() {
+        Some(sandbox) => provider_applied_with_sandbox(provider, sandbox, provider_consumed),
+        None => provider,
+    });
+    openshell_core::proto::ConfigBootstrapResult {
+        results: provider.into_iter().chain(sandbox).collect(),
+        admission,
+    }
 }
 
 #[derive(Debug)]
@@ -4558,699 +4522,1141 @@ impl RejectedStreamSandbox {
         snapshot: &openshell_core::grpc_client::SettingsPollResult,
         requested_revision: &openshell_core::proto::ConfigSnapshotRevision,
         environment: &EnvironmentIdentity,
-        error: &str,
     ) -> bool {
         self.configuration_instance_id == snapshot.configuration_instance_id
             && self.requested_revision == *requested_revision
             && self.environment == *environment
-            && self.error == error
+            && self.error == snapshot.configuration_error
             && self.failure_mode == snapshot.policy_validation_failure_mode
     }
 }
 
-#[derive(Debug)]
+/// Snapshots delivered over the supervisor session. Each component arrives
+/// separately, so a sandbox configuration and the provider environment it
+/// names wait for each other before either is installed.
+#[derive(Default)]
 struct StreamConfigurationState {
+    /// Provider environment installed from the last activated delivery.
     active_environment: EnvironmentIdentity,
-    pending_provider: Option<PendingStreamProvider>,
+    /// Provider snapshot waiting for its matching sandbox configuration.
+    pending_provider: Option<CapturedProviderEnvironment>,
+    /// Sandbox configuration waiting for its matching provider snapshot.
     pending_sandbox: Option<Box<openshell_core::grpc_client::SettingsPollResult>>,
+    /// Last rejected configuration, so a redelivery does not quarantine the
+    /// runtime again.
     rejected_sandbox: Option<Box<RejectedStreamSandbox>>,
+    /// Startup configuration whose middleware could not connect. A poll
+    /// retries the registry on every interval; session delivery has no later
+    /// snapshot to carry that retry, so the idle loop retries this one.
+    degraded_startup: Option<Box<openshell_core::grpc_client::SettingsPollResult>>,
 }
 
-impl StreamConfigurationState {
-    fn new(initial: Option<&openshell_core::grpc_client::SettingsPollResult>) -> Self {
+/// Where a reconciled sandbox configuration's provider environment comes from.
+enum ProviderSource {
+    /// Policy polling fetches the environment when the requested one changed
+    /// or the last installation needs a retry.
+    Fetch,
+    /// Session delivery already staged the matching environment, or `None`
+    /// when the installed environment matches.
+    Delivered(Option<CapturedProviderEnvironment>),
+}
+
+/// Why a sandbox configuration snapshot was not activated.
+struct ConfigRejection {
+    /// Stable failure code reported on the supervisor session.
+    code: &'static str,
+    /// Diagnostic reported on the supervisor session.
+    detail: String,
+    /// Error reported with the rejected configuration admission.
+    admission_error: String,
+}
+
+enum ReconcileOutcome {
+    /// The runtime already enforces the snapshot.
+    Unchanged,
+    /// The runtime now enforces the snapshot.
+    Applied,
+    Rejected(ConfigRejection),
+}
+
+struct Reconciled {
+    outcome: ReconcileOutcome,
+    /// Policy load status for `ReportPolicyStatus`. Session delivery reports
+    /// the same status through its acknowledgement instead.
+    policy_status: Option<PolicyStatusUpdate>,
+}
+
+impl Reconciled {
+    fn rejected(code: &'static str, detail: String, admission_error: String) -> Self {
         Self {
-            active_environment: initial
-                .filter(|snapshot| snapshot.configuration_admitted)
-                .map(EnvironmentIdentity::from_settings)
-                .unwrap_or_default(),
-            pending_provider: None,
-            pending_sandbox: None,
-            rejected_sandbox: None,
+            outcome: ReconcileOutcome::Rejected(ConfigRejection {
+                code,
+                detail,
+                admission_error,
+            }),
+            policy_status: None,
         }
     }
 }
 
-fn stream_generation_pending_result(
-    component: openshell_core::proto::ConfigComponent,
-    requested_revision: openshell_core::proto::ConfigSnapshotRevision,
-) -> openshell_core::proto::ConfigComponentApplyResult {
-    config_apply_result(
-        component,
-        requested_revision,
-        None,
-        openshell_core::proto::ConfigApplyOutcome::AwaitingComponent,
-        None,
-    )
-}
-
-fn is_awaiting_component(result: &openshell_core::proto::ConfigComponentApplyResult) -> bool {
-    result.outcome == i32::from(openshell_core::proto::ConfigApplyOutcome::AwaitingComponent)
-}
-
-fn stage_stream_provider_snapshot(
-    snapshot: openshell_core::proto::ProviderEnvironmentSnapshot,
-    state: &mut StreamConfigurationState,
-) -> openshell_core::proto::ConfigComponentApplyResult {
-    use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
-
-    let requested_revision = provider_config_revision(snapshot.provider_env_revision);
-    let result: openshell_core::grpc_client::ProviderEnvironmentResult = snapshot.into();
-    let identity = EnvironmentIdentity::from_environment(&result);
-    if identity == state.active_environment {
-        return config_apply_result(
-            ConfigComponent::ProviderEnvironment,
-            requested_revision.clone(),
-            Some(requested_revision),
-            ConfigApplyOutcome::IgnoredDuplicate,
-            None,
-        );
-    }
-    // A newer component delivery supersedes any older unmatched provider
-    // snapshot. Never let a later sandbox delivery commit stale credentials.
-    state.pending_provider = None;
-    if !provider_environment_is_installable(result.readiness_reason) {
-        return config_apply_result(
-            ConfigComponent::ProviderEnvironment,
-            requested_revision,
-            None,
-            ConfigApplyOutcome::FailedClosed,
-            Some((
-                "provider_environment_unavailable",
-                "provider environment is not ready for installation".to_string(),
-                true,
-            )),
-        );
-    }
-    let credentials = match prepare_provider_environment(&result) {
-        Ok(credentials) => credentials,
-        Err(error) => {
-            return config_apply_result(
-                ConfigComponent::ProviderEnvironment,
-                requested_revision,
-                None,
-                ConfigApplyOutcome::FailedClosed,
-                Some(("invalid_provider_environment", error.to_string(), false)),
-            );
-        }
-    };
-    let expires_at_ms = result
-        .credential_expires_at_ms
-        .values()
-        .copied()
-        .filter(|expiry| *expiry > 0)
-        .min();
-    state.pending_provider = Some(PendingStreamProvider {
-        identity,
-        credentials,
-        expires_at_ms,
-    });
-    // The provider environment waits for its matching admitted sandbox
-    // configuration.
-    stream_generation_pending_result(ConfigComponent::ProviderEnvironment, requested_revision)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn apply_stream_config_request<C: PolicyGatewayClient>(
-    ctx: &PolicyPollLoopContext,
-    client: &C,
-    request: openshell_supervisor_process::supervisor_session::ConfigApplyRequest,
-    current_config_revision: &mut u64,
-    current_stream_sandbox_revision: &mut Option<openshell_core::proto::ConfigSnapshotRevision>,
-    current_provider_env_revision: &mut u64,
-    current_policy_version: &mut u32,
-    current_policy_hash: &mut String,
-    current_endpoint_policy: &mut Option<openshell_core::proto::SandboxPolicy>,
-    current_middleware_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
-    current_extension_authentication_enabled: &mut bool,
-    middleware_registry_status: &mut MiddlewareRegistryStatus,
-    current_settings: &mut std::collections::HashMap<
-        String,
-        openshell_core::proto::EffectiveSetting,
-    >,
-    stream_state: &mut StreamConfigurationState,
+/// Configuration the supervisor runtime has applied.
+///
+/// Policy polling and session delivery share this state and one reconcile
+/// path. They differ only in where snapshots and provider environments come
+/// from and in how results reach the gateway.
+struct ConfigRuntime {
     reloads_gateway_policy: bool,
-    has_last_valid_policy: &mut bool,
-) {
-    use openshell_core::proto::{ConfigBootstrapResult, ConfigUpdateResult, config_update};
-    use openshell_supervisor_process::supervisor_session::ConfigApplyRequest;
+    config_revision: u64,
+    /// Last applied sandbox revision. A failed delivery reports it as the
+    /// retained revision while its policy remains enforced.
+    applied_revision: Option<openshell_core::proto::ConfigSnapshotRevision>,
+    provider_env_revision: u64,
+    policy_version: u32,
+    policy_hash: String,
+    policy_generation: Option<PolicyGenerationGuard>,
+    endpoint_policy: Option<openshell_core::proto::SandboxPolicy>,
+    middleware_services: Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    extension_authentication_enabled: bool,
+    middleware_registry_status: MiddlewareRegistryStatus,
+    settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    last_failed_runtime_revision: Option<FailedRuntimeRevision>,
+    rejected_policy_generation: Option<RejectedPolicyGeneration>,
+    has_last_valid_policy: bool,
+    stream: StreamConfigurationState,
+}
 
-    match request {
-        ConfigApplyRequest::Bootstrap {
-            bootstrap,
-            response,
-        } => {
-            let mut results = Vec::with_capacity(2);
-            let mut admission = None;
-            if let Some(snapshot) = bootstrap.provider_environment {
-                results.push(stage_stream_provider_snapshot(snapshot, stream_state));
-            }
-            if let Some(snapshot) = bootstrap.sandbox_config {
-                let expected_admission = snapshot.clone();
-                let result = apply_stream_sandbox_snapshot(
-                    ctx,
-                    client,
-                    snapshot.into(),
-                    current_config_revision,
-                    current_stream_sandbox_revision,
-                    current_policy_version,
-                    current_policy_hash,
-                    current_endpoint_policy,
-                    current_middleware_services,
-                    current_extension_authentication_enabled,
-                    middleware_registry_status,
-                    current_settings,
-                    stream_state,
-                    current_provider_env_revision,
-                    reloads_gateway_policy,
-                    has_last_valid_policy,
-                )
-                .await;
-                admission = Some(streamed_configuration_admission(
-                    &expected_admission,
-                    config_apply_result_activates(&result),
-                ));
-                results.push(result);
-            }
-            if let Some(provider_result) = results.iter_mut().find(|result| {
-                result.component
-                    == i32::from(openshell_core::proto::ConfigComponent::ProviderEnvironment)
-            }) && admission.as_ref().is_some_and(|admission| {
-                admission.state
-                    == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
-            }) && stream_state.pending_provider.is_none()
-                && is_awaiting_component(provider_result)
-            {
-                let requested_revision = provider_result
-                    .requested_revision
-                    .clone()
-                    .unwrap_or_default();
-                *provider_result = config_apply_result(
-                    openshell_core::proto::ConfigComponent::ProviderEnvironment,
-                    requested_revision.clone(),
-                    Some(requested_revision),
-                    openshell_core::proto::ConfigApplyOutcome::Applied,
-                    None,
-                );
-            }
-            let _ = response.send(ConfigBootstrapResult { results, admission });
+impl ConfigRuntime {
+    /// Seed the trackers from startup. A stream bootstrap already initialized
+    /// the runtime, so an admitted one is treated as applied.
+    fn new(
+        ctx: &PolicyPollLoopContext,
+        initial: Option<&openshell_core::grpc_client::SettingsPollResult>,
+    ) -> Self {
+        let admitted = initial.filter(|snapshot| snapshot.configuration_admitted);
+        let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
+        Self {
+            reloads_gateway_policy,
+            config_revision: initial.map_or(0, |snapshot| snapshot.config_revision),
+            applied_revision: admitted
+                .filter(|_| reloads_gateway_policy)
+                .map(sandbox_config_revision),
+            provider_env_revision: ctx.provider_credentials.snapshot().revision,
+            policy_version: admitted.map_or(0, |snapshot| snapshot.version),
+            policy_hash: admitted.map_or_else(String::new, |snapshot| snapshot.policy_hash.clone()),
+            policy_generation: None,
+            endpoint_policy: ctx.endpoint_policy.clone(),
+            middleware_services: admitted.map_or_else(Vec::new, |snapshot| {
+                snapshot.supervisor_middleware_services.clone()
+            }),
+            extension_authentication_enabled: admitted
+                .map_or(ctx.extension_authentication_enabled, |snapshot| {
+                    snapshot.extension_authentication_enabled
+                }),
+            middleware_registry_status: ctx.middleware_registry_status,
+            settings: admitted.map_or_else(std::collections::HashMap::new, |snapshot| {
+                snapshot.settings.clone()
+            }),
+            last_failed_runtime_revision: None,
+            rejected_policy_generation: None,
+            has_last_valid_policy: ctx.loaded_policy_origin.has_last_valid_policy(),
+            stream: StreamConfigurationState {
+                active_environment: admitted
+                    .map(EnvironmentIdentity::from_settings)
+                    .unwrap_or_default(),
+                degraded_startup: admitted
+                    .filter(|_| {
+                        ctx.middleware_registry_status
+                            == MiddlewareRegistryStatus::NeedsReconciliation
+                    })
+                    .map(|snapshot| Box::new(snapshot.clone())),
+                ..StreamConfigurationState::default()
+            },
         }
-        ConfigApplyRequest::Update { update, response } => {
-            let mut admission = None;
-            let result = match update.component {
-                Some(config_update::Component::SandboxConfig(snapshot)) => {
-                    let expected_admission = snapshot.clone();
-                    let result = apply_stream_sandbox_snapshot(
-                        ctx,
-                        client,
-                        snapshot.into(),
-                        current_config_revision,
-                        current_stream_sandbox_revision,
-                        current_policy_version,
-                        current_policy_hash,
-                        current_endpoint_policy,
-                        current_middleware_services,
-                        current_extension_authentication_enabled,
-                        middleware_registry_status,
-                        current_settings,
-                        stream_state,
-                        current_provider_env_revision,
-                        reloads_gateway_policy,
-                        has_last_valid_policy,
-                    )
-                    .await;
-                    admission = Some(streamed_configuration_admission(
-                        &expected_admission,
-                        config_apply_result_activates(&result),
-                    ));
-                    result
+    }
+
+    /// Bring the runtime to one sandbox configuration snapshot.
+    ///
+    /// The caller reports the outcome, then records an applied snapshot with
+    /// [`Self::commit`]. A failed report leaves it to be reconciled again.
+    async fn reconcile<C: PolicyGatewayClient>(
+        &mut self,
+        ctx: &PolicyPollLoopContext,
+        client: &C,
+        result: &openshell_core::grpc_client::SettingsPollResult,
+        provider: ProviderSource,
+    ) -> Result<Reconciled> {
+        use openshell_core::proto::PolicySource;
+        use std::sync::atomic::Ordering;
+
+        let reloads_gateway_policy = self.reloads_gateway_policy;
+        let mut policy_status = None;
+
+        // Reuse installed per-service credentials, rotating only when one is
+        // missing or due. Rotation happens on the existing gateway channel and
+        // updates slots in place, so it is independent of config revision and
+        // registry equality.
+        let middleware_credentials = if result.extension_authentication_enabled {
+            match client
+                .extension_credentials_for(&result.supervisor_middleware_services)
+                .await
+            {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    warn!(error = %error, "Settings poll: extension credential refresh failed");
+                    std::collections::HashMap::new()
                 }
-                Some(config_update::Component::ProviderEnvironment(snapshot)) => {
-                    let mut provider_result =
-                        stage_stream_provider_snapshot(snapshot, stream_state);
-                    if is_awaiting_component(&provider_result)
-                        && let Some(pending_sandbox) = stream_state.pending_sandbox.take()
-                    {
-                        let sandbox_result = apply_stream_sandbox_snapshot(
-                            ctx,
-                            client,
-                            *pending_sandbox,
-                            current_config_revision,
-                            current_stream_sandbox_revision,
-                            current_policy_version,
-                            current_policy_hash,
-                            current_endpoint_policy,
-                            current_middleware_services,
-                            current_extension_authentication_enabled,
-                            middleware_registry_status,
-                            current_settings,
-                            stream_state,
-                            current_provider_env_revision,
-                            reloads_gateway_policy,
-                            has_last_valid_policy,
-                        )
-                        .await;
-                        if config_apply_result_activates(&sandbox_result)
-                            && stream_state.pending_provider.is_none()
-                        {
-                            let requested_revision = provider_result
-                                .requested_revision
-                                .clone()
-                                .unwrap_or_default();
-                            provider_result = config_apply_result(
-                                openshell_core::proto::ConfigComponent::ProviderEnvironment,
-                                requested_revision.clone(),
-                                Some(requested_revision),
-                                openshell_core::proto::ConfigApplyOutcome::Applied,
-                                None,
-                            );
-                        }
-                    }
-                    provider_result
-                }
-                None => config_apply_result(
-                    openshell_core::proto::ConfigComponent::Unspecified,
-                    openshell_core::proto::ConfigSnapshotRevision::default(),
-                    None,
-                    openshell_core::proto::ConfigApplyOutcome::Unsupported,
-                    Some((
-                        "unsupported_component",
-                        "configuration update has no supported component".to_string(),
-                        false,
-                    )),
-                ),
-            };
-            let _ = response.send(ConfigUpdateResult {
-                update_id: update.update_id,
-                component_sequence: update.component_sequence,
-                result: Some(result),
-                admission,
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        if reloads_gateway_policy && !result.configuration_admitted {
+            let disposition = apply_policy_validation_failure(
+                &ctx.opa_engine,
+                result.policy_validation_failure_mode,
+                self.has_last_valid_policy,
+                result.version,
+                &result.configuration_error,
+            )?;
+            emit_policy_validation_failure(
+                &disposition,
+                result.version,
+                &result.policy_hash,
+                &result.configuration_error,
+            );
+            self.rejected_policy_generation = Some(RejectedPolicyGeneration {
+                version: result.version,
+                policy_hash: result.policy_hash.clone(),
+                validation_error: result.configuration_error.clone(),
+                configured_mode: result.policy_validation_failure_mode,
+            });
+            return Ok(Reconciled::rejected(
+                "configuration_rejected",
+                result.configuration_error.clone(),
+                result.configuration_error.clone(),
+            ));
+        }
+
+        let config_changed = result.config_revision != self.config_revision;
+        let desired_identity = EnvironmentIdentity::from_settings(result);
+        let provider_env_changed = match &provider {
+            ProviderSource::Fetch => {
+                result.provider_env_revision != self.provider_env_revision
+                    || ctx.provider_readiness.needs_environment(&desired_identity)
+            }
+            ProviderSource::Delivered(provider) => provider.is_some(),
+        };
+        let policy_changed = result.policy_hash != self.policy_hash;
+        let extension_authentication_changed =
+            self.extension_authentication_enabled != result.extension_authentication_enabled;
+        let middleware_registry_changed = extension_authentication_changed
+            || middleware_registry_needs_rebuild(
+                self.middleware_registry_status,
+                &self.middleware_services,
+                &result.supervisor_middleware_services,
+            );
+        // A valid candidate may intentionally restore byte-for-byte policy
+        // content that was active before a rejected update. Its hash then
+        // equals `policy_hash`, but the runtime is still quarantined and must
+        // reload (or it would remain deny-all indefinitely).
+        let recovering_rejected_policy = reloads_gateway_policy
+            && self.rejected_policy_generation.is_some()
+            && result.configuration_admitted;
+        let policy_runtime_changed = (reloads_gateway_policy
+            && (provider_env_changed
+                || self
+                    .policy_generation
+                    .as_ref()
+                    .is_some_and(PolicyGenerationGuard::is_stale)))
+            || recovering_rejected_policy
+            || extension_authentication_changed
+            || gateway_policy_runtime_needs_reconciliation(
+                reloads_gateway_policy,
+                &self.policy_hash,
+                &result.policy_hash,
+                &self.middleware_services,
+                &result.supervisor_middleware_services,
+                self.middleware_registry_status,
+            );
+        // Recovery already has its own acknowledgement path below. Giving it
+        // precedence here prevents a restored last-known-good policy from
+        // also being acknowledged as an ordinary same-hash revision.
+        let unchanged_policy_revision = unchanged_policy_revision_candidate(
+            reloads_gateway_policy,
+            recovering_rejected_policy,
+            self.policy_version,
+            &self.policy_hash,
+            result,
+        );
+        let mut policy_runtime_reconciled = false;
+
+        // A local policy override is not coupled to the gateway policy
+        // snapshot, so its service registry can still be reconciled alone.
+        // Gateway policy snapshots, however, must install policy and registry
+        // as one generation below.
+        if !reloads_gateway_policy {
+            reconcile_middleware_registry(
+                &ctx.opa_engine,
+                &ctx.middleware_connector,
+                MiddlewareRegistryReconciliation {
+                    desired_services: &result.supervisor_middleware_services,
+                    authentication: MiddlewareAuthentication {
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
+                    },
+                    registry_changed: middleware_registry_changed,
+                    extension_credentials: &ctx.extension_credentials,
+                    current_services: &mut self.middleware_services,
+                    status: &mut self.middleware_registry_status,
+                },
+            )
+            .await;
+            if self.middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
+                self.extension_authentication_enabled = result.extension_authentication_enabled;
+            }
+        }
+
+        if !config_changed
+            && !provider_env_changed
+            && !policy_runtime_changed
+            && unchanged_policy_revision.is_none()
+        {
+            return Ok(Reconciled {
+                outcome: ReconcileOutcome::Unchanged,
+                policy_status: None,
             });
         }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
-    ctx: &PolicyPollLoopContext,
-    client: &C,
-    snapshot: openshell_core::grpc_client::SettingsPollResult,
-    current_config_revision: &mut u64,
-    current_stream_revision: &mut Option<openshell_core::proto::ConfigSnapshotRevision>,
-    current_policy_version: &mut u32,
-    current_policy_hash: &mut String,
-    current_endpoint_policy: &mut Option<openshell_core::proto::SandboxPolicy>,
-    current_middleware_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
-    current_extension_authentication_enabled: &mut bool,
-    middleware_registry_status: &mut MiddlewareRegistryStatus,
-    current_settings: &mut std::collections::HashMap<
-        String,
-        openshell_core::proto::EffectiveSetting,
-    >,
-    stream_state: &mut StreamConfigurationState,
-    current_provider_env_revision: &mut u64,
-    reloads_gateway_policy: bool,
-    has_last_valid_policy: &mut bool,
-) -> openshell_core::proto::ConfigComponentApplyResult {
-    use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent, PolicySource};
-    use std::sync::atomic::Ordering;
+        if config_changed || provider_env_changed {
+            // Log which settings changed.
+            log_setting_changes(&self.settings, &result.settings);
 
-    let requested_revision = sandbox_config_revision(&snapshot);
-    let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
-    let environment_changed = desired_environment != stream_state.active_environment;
-    if snapshot.configuration_admitted
-        && reloads_gateway_policy
-        && current_stream_revision.as_ref() == Some(&requested_revision)
-        && desired_environment == stream_state.active_environment
-    {
-        stream_state.rejected_sandbox = None;
-        return config_apply_result(
-            ConfigComponent::SandboxConfig,
-            requested_revision.clone(),
-            Some(requested_revision),
-            ConfigApplyOutcome::IgnoredDuplicate,
-            None,
-        );
-    }
-
-    if !snapshot.configuration_admitted {
-        stream_state.pending_sandbox = None;
-        if !reloads_gateway_policy {
-            return config_apply_result(
-                ConfigComponent::SandboxConfig,
-                requested_revision,
-                None,
-                ConfigApplyOutcome::RetainedLocalOverride,
-                None,
-            );
-        }
-        let error = if snapshot.configuration_error.is_empty() {
-            "effective configuration was rejected by the gateway"
-        } else {
-            &snapshot.configuration_error
-        };
-        if let Some(rejected) = stream_state.rejected_sandbox.as_ref()
-            && rejected.matches(&snapshot, &requested_revision, &desired_environment, error)
-        {
-            return rejected.result.clone();
-        }
-        let (result, cacheable) = match apply_policy_validation_failure(
-            &ctx.opa_engine,
-            snapshot.policy_validation_failure_mode,
-            *has_last_valid_policy,
-            snapshot.version,
-            error,
-        ) {
-            Ok(disposition) => {
-                emit_policy_validation_failure(
-                    &disposition,
-                    snapshot.version,
-                    &snapshot.policy_hash,
-                    error,
-                );
-                let applied_revision = disposition
-                    .previous_policy_active
-                    .then(|| current_stream_revision.clone())
-                    .flatten();
-                let outcome = if applied_revision.is_some() {
-                    ConfigApplyOutcome::FailedRetainedLastKnownGood
-                } else {
-                    ConfigApplyOutcome::FailedClosed
-                };
-                (
-                    config_apply_result(
-                        ConfigComponent::SandboxConfig,
-                        requested_revision.clone(),
-                        applied_revision,
-                        outcome,
-                        Some(("configuration_rejected", error.to_string(), true)),
-                    ),
-                    true,
-                )
+            // A posture change after a rejected update takes effect immediately.
+            // The compiled last-known-good engine remains available beneath a
+            // fail-closed quarantine, so an explicit retain_last_valid selection
+            // can reactivate it without accepting any part of the invalid policy.
+            if !policy_changed && let Some(rejected) = self.rejected_policy_generation.as_mut() {
+                let mode = result.policy_validation_failure_mode;
+                if mode != rejected.configured_mode {
+                    let disposition = apply_policy_validation_failure(
+                        &ctx.opa_engine,
+                        mode,
+                        self.has_last_valid_policy,
+                        rejected.version,
+                        &rejected.validation_error,
+                    )?;
+                    emit_policy_validation_failure(
+                        &disposition,
+                        rejected.version,
+                        &rejected.policy_hash,
+                        &rejected.validation_error,
+                    );
+                    rejected.configured_mode = mode;
+                }
             }
-            Err(failure) => (
-                config_apply_result(
-                    ConfigComponent::SandboxConfig,
-                    requested_revision.clone(),
-                    None,
-                    ConfigApplyOutcome::FailedClosed,
-                    Some(("configuration_rejected", failure.to_string(), true)),
-                ),
-                false,
-            ),
-        };
-        if cacheable {
-            stream_state.rejected_sandbox = Some(Box::new(RejectedStreamSandbox {
-                configuration_instance_id: snapshot.configuration_instance_id,
-                requested_revision,
-                environment: desired_environment,
-                error: error.to_string(),
-                failure_mode: snapshot.policy_validation_failure_mode,
-                result: result.clone(),
-            }));
+
+            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Other, "detected")
+                .unmapped("old_config_revision", serde_json::json!(self.config_revision))
+                .unmapped("new_config_revision", serde_json::json!(result.config_revision))
+                .unmapped("policy_changed", serde_json::json!(policy_changed))
+                .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
+                .message(format!(
+                    "Settings poll: config change detected [old_revision:{} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
+                    self.config_revision,
+                    result.config_revision
+                ))
+                .build());
         }
-        return result;
-    }
 
-    if desired_environment != stream_state.active_environment
-        && stream_state
-            .pending_provider
-            .as_ref()
-            .is_none_or(|provider| provider.identity != desired_environment)
-    {
-        stream_state.pending_sandbox = Some(Box::new(snapshot));
-        // The sandbox configuration waits for its matching provider environment.
-        return stream_generation_pending_result(
-            ConfigComponent::SandboxConfig,
-            requested_revision,
-        );
-    }
+        // Prepare the matching environment before activation. Failed refreshes
+        // revoke static credentials while preserving independently bound dynamic grants.
+        let prepared_provider = match provider {
+            _ if !provider_env_changed => None,
+            ProviderSource::Fetch => {
+                match self
+                    .fetch_provider_environment(ctx, client, result, &desired_identity)
+                    .await
+                {
+                    Ok(prepared) => Some(prepared),
+                    Err(rejection) => {
+                        return Ok(Reconciled {
+                            outcome: ReconcileOutcome::Rejected(rejection),
+                            policy_status: None,
+                        });
+                    }
+                }
+            }
+            ProviderSource::Delivered(provider) => provider,
+        };
 
-    let snapshot_for_retry = Box::new(snapshot.clone());
-    let middleware_credentials = if snapshot.extension_authentication_enabled {
-        client
-            .extension_credentials_for(&snapshot.supervisor_middleware_services)
-            .await
-            .unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
-    let registry_changed = *current_extension_authentication_enabled
-        != snapshot.extension_authentication_enabled
-        || middleware_registry_needs_rebuild(
-            *middleware_registry_status,
-            current_middleware_services,
-            &snapshot.supervisor_middleware_services,
-        );
-
-    let outcome = if reloads_gateway_policy {
-        let runtime_changed = *current_policy_hash != snapshot.policy_hash || registry_changed;
-        if runtime_changed {
-            let matching_provider = stream_state
-                .pending_provider
-                .as_ref()
-                .filter(|provider| provider.identity == desired_environment);
-            match reload_gateway_configuration_runtime(
+        let mut runtime_error = String::new();
+        if policy_runtime_changed {
+            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
+            let runtime_result = reload_gateway_configuration_runtime(
                 &ctx.opa_engine,
-                snapshot.policy.as_ref(),
-                ctx.entrypoint_pid.load(Ordering::Acquire),
+                result.policy.as_ref(),
+                pid,
                 MiddlewareReloadContext {
-                    desired_services: &snapshot.supervisor_middleware_services,
+                    desired_services: &result.supervisor_middleware_services,
                     authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials,
-                        enabled: snapshot.extension_authentication_enabled,
+                        credentials: middleware_credentials.clone(),
+                        enabled: result.extension_authentication_enabled,
                     },
-                    registry_changed,
+                    registry_changed: middleware_registry_changed,
                     connector: &ctx.middleware_connector,
                 },
                 ctx.transparent_tcp,
                 ctx.vm_identity,
                 || {
-                    if let Some(provider) = matching_provider {
+                    if let Some(prepared) = prepared_provider.as_ref() {
                         ctx.provider_credentials
-                            .install_prepared(&provider.credentials);
+                            .install_prepared(&prepared.credentials);
                     }
                 },
             )
-            .await
-            {
-                Ok(_generation) => {
-                    if let Some(provider) = matching_provider {
+            .await;
+
+            match runtime_result {
+                Ok(generation) => {
+                    policy_runtime_reconciled = true;
+                    if let Some(prepared) = prepared_provider.as_ref() {
                         ctx.provider_readiness.credentials_installed(
-                            provider.identity.clone(),
+                            prepared.identity.clone(),
                             &ctx.provider_credentials,
-                            provider.expires_at_ms,
+                            prepared.expires_at_ms,
                         );
                     }
-                    stream_state.active_environment = desired_environment.clone();
-                    *current_provider_env_revision = desired_environment.revision;
-                    if matching_provider.is_some() {
-                        stream_state.pending_provider = None;
-                    }
-                    if let Some(policy) = snapshot.policy.as_ref()
-                        && let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref()
-                    {
-                        policy_local_ctx.set_current_policy(policy.clone()).await;
-                    }
-                    *has_last_valid_policy = true;
-                    current_policy_hash.clone_from(&snapshot.policy_hash);
-                    current_middleware_services
-                        .clone_from(&snapshot.supervisor_middleware_services);
-                    *current_extension_authentication_enabled =
-                        snapshot.extension_authentication_enabled;
-                    *middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-                    Ok(ConfigApplyOutcome::Applied)
-                }
-                Err(failure) => {
-                    let failure_mode = snapshot.policy_validation_failure_mode;
-                    let (outcome, error) = match apply_gateway_runtime_reload_failure(
-                        &ctx.opa_engine,
-                        failure,
-                        failure_mode,
-                        *has_last_valid_policy,
-                        snapshot.version,
-                    ) {
-                        Ok(GatewayRuntimeFailureDisposition::PolicyRejected {
-                            error,
-                            disposition,
-                        }) => {
-                            emit_policy_validation_failure(
-                                &disposition,
-                                snapshot.version,
-                                &snapshot.policy_hash,
-                                &error,
-                            );
-                            let outcome = if disposition.previous_policy_active {
-                                ConfigApplyOutcome::FailedRetainedLastKnownGood
-                            } else {
-                                ConfigApplyOutcome::FailedClosed
-                            };
-                            (outcome, error)
+                    ctx.provider_readiness.policy_activated(
+                        &desired_identity,
+                        result.config_revision,
+                        generation.clone(),
+                    );
+                    self.policy_generation = Some(generation);
+                    let policy = result
+                        .policy
+                        .as_ref()
+                        .expect("successful runtime reload requires a policy payload");
+                    self.has_last_valid_policy = true;
+                    self.rejected_policy_generation = None;
+                    if policy_changed {
+                        if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
+                            policy_local_ctx.set_current_policy(policy.clone()).await;
                         }
-                        Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error }) => {
+                        if result.global_policy_version > 0 {
                             ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Medium)
-                                .status(StatusId::Failure)
-                                .state(StateId::Other, "failed")
-                                .unmapped("version", serde_json::json!(snapshot.version))
-                                .unmapped("error", serde_json::json!(&error))
-                                .unmapped("previous_policy_active", serde_json::json!(true))
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .unmapped("global_version", serde_json::json!(result.global_policy_version))
                                 .message(format!(
-                                    "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
-                                    snapshot.version
+                                    "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
+                                    result.policy_hash,
+                                    result.global_policy_version
                                 ))
                                 .build());
-                            (ConfigApplyOutcome::FailedRetainedLastKnownGood, error)
-                        }
-                        Ok(GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                            error,
-                            active_generation,
-                        }) => {
-                            emit_transparent_tcp_expansion_rejection(
-                                snapshot.version,
-                                &snapshot.policy_hash,
-                                active_generation,
-                                &error,
+                        } else {
+                            ocsf_emit!(
+                                ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Informational)
+                                    .status(StatusId::Success)
+                                    .state(StateId::Enabled, "loaded")
+                                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                    .message(format!(
+                                        "Policy reloaded successfully [policy_hash:{}]",
+                                        result.policy_hash
+                                    ))
+                                    .build()
                             );
-                            (ConfigApplyOutcome::FailedRetainedLastKnownGood, error)
                         }
-                        Err(error) => (ConfigApplyOutcome::FailedClosed, error.to_string()),
-                    };
-                    Err((outcome, error))
+                        if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                            policy_status = Some(PolicyStatusUpdate::loaded(result.version));
+                            self.policy_version = result.version;
+                        }
+                    } else if recovering_rejected_policy
+                        && result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                    {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .message(format!(
+                                    "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
+                                    result.policy_hash
+                                ))
+                                .build()
+                        );
+                        policy_status = Some(PolicyStatusUpdate::loaded(result.version));
+                        self.policy_version = result.version;
+                    }
+
+                    if middleware_registry_changed {
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "supervisor_middleware_service_count",
+                                serde_json::json!(result.supervisor_middleware_services.len())
+                            )
+                            .message(format!(
+                                "Supervisor policy runtime reloaded atomically [service_count:{}]",
+                                result.supervisor_middleware_services.len()
+                            ))
+                            .build());
+                    }
+
+                    self.policy_hash.clone_from(&result.policy_hash);
+                    self.endpoint_policy.clone_from(&result.policy);
+                    self.middleware_services
+                        .clone_from(&result.supervisor_middleware_services);
+                    self.extension_authentication_enabled = result.extension_authentication_enabled;
+                    retain_extension_credentials(
+                        &ctx.extension_credentials,
+                        &result.supervisor_middleware_services,
+                        result.extension_authentication_enabled,
+                    );
+                    self.middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
+                    self.last_failed_runtime_revision = None;
+                }
+                Err(failure) => {
+                    runtime_error = failure.to_string();
+                    ctx.provider_readiness
+                        .policy_install_failed(desired_identity.clone(), result.config_revision);
+                    let failed_revision = FailedRuntimeRevision::new(
+                        result.config_revision,
+                        &result.policy_hash,
+                        &failure,
+                    );
+                    if self.last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
+                        let failure_mode = result.policy_validation_failure_mode;
+                        match apply_gateway_runtime_reload_failure(
+                            &ctx.opa_engine,
+                            failure,
+                            failure_mode,
+                            self.has_last_valid_policy,
+                            result.version,
+                        )? {
+                            GatewayRuntimeFailureDisposition::PolicyRejected {
+                                error,
+                                disposition,
+                            } => {
+                                emit_policy_validation_failure(
+                                    &disposition,
+                                    result.version,
+                                    &result.policy_hash,
+                                    &error,
+                                );
+                                self.rejected_policy_generation = Some(RejectedPolicyGeneration {
+                                    version: result.version,
+                                    policy_hash: result.policy_hash.clone(),
+                                    validation_error: error.clone(),
+                                    configured_mode: failure_mode,
+                                });
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    policy_status =
+                                        Some(PolicyStatusUpdate::failed(result.version, error));
+                                }
+                            }
+                            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error } => {
+                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Medium)
+                                    .status(StatusId::Failure)
+                                    .state(StateId::Other, "failed")
+                                    .unmapped("version", serde_json::json!(result.version))
+                                    .unmapped("error", serde_json::json!(&error))
+                                    .unmapped("previous_policy_active", serde_json::json!(true))
+                                    .message(format!(
+                                        "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
+                                        result.version
+                                    ))
+                                    .build());
+                            }
+                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
+                                error,
+                                active_generation,
+                            } => {
+                                emit_transparent_tcp_expansion_rejection(
+                                    result.version,
+                                    &result.policy_hash,
+                                    active_generation,
+                                    &error,
+                                );
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    policy_status =
+                                        Some(PolicyStatusUpdate::failed(result.version, error));
+                                }
+                            }
+                        }
+                    }
+                    self.last_failed_runtime_revision = Some(failed_revision);
+                    // Nothing was installed, so the registry status still
+                    // describes the live registry. The retry is driven by the
+                    // persisting hash/service-set mismatch (or an existing
+                    // NeedsReconciliation), not by degrading the status here.
                 }
             }
-        } else {
-            if let Some(provider) = stream_state
-                .pending_provider
-                .as_ref()
-                .filter(|provider| provider.identity == desired_environment)
-            {
-                ctx.provider_credentials
-                    .install_prepared(&provider.credentials);
-                ctx.provider_readiness.credentials_installed(
-                    provider.identity.clone(),
-                    &ctx.provider_credentials,
-                    provider.expires_at_ms,
-                );
-                stream_state.active_environment = desired_environment.clone();
-                *current_provider_env_revision = desired_environment.revision;
-                stream_state.pending_provider = None;
-            }
-            Ok(ConfigApplyOutcome::Applied)
         }
-    } else {
-        reconcile_middleware_registry(
-            &ctx.opa_engine,
-            &ctx.middleware_connector,
-            MiddlewareRegistryReconciliation {
-                desired_services: &snapshot.supervisor_middleware_services,
-                authentication: MiddlewareAuthentication {
-                    credentials: middleware_credentials,
-                    enabled: snapshot.extension_authentication_enabled,
-                },
-                registry_changed,
-                extension_credentials: &ctx.extension_credentials,
-                current_services: current_middleware_services,
-                status: middleware_registry_status,
-            },
+
+        if policy_runtime_changed && !policy_runtime_reconciled {
+            return Ok(Reconciled {
+                outcome: ReconcileOutcome::Rejected(ConfigRejection {
+                    code: "runtime_apply_failed",
+                    detail: runtime_error,
+                    admission_error: "Effective configuration failed runtime preparation; prior credentials remain installed".to_string(),
+                }),
+                policy_status,
+            });
+        }
+        if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
+            ctx.provider_credentials
+                .install_prepared(&prepared.credentials);
+            ctx.provider_readiness.credentials_installed(
+                prepared.identity.clone(),
+                &ctx.provider_credentials,
+                prepared.expires_at_ms,
+            );
+        }
+        if provider_env_changed || policy_runtime_reconciled {
+            self.provider_env_revision = result.provider_env_revision;
+        }
+
+        if let Some(version) = unchanged_policy_revision_ready_to_ack(
+            unchanged_policy_revision,
+            policy_runtime_changed,
+            policy_runtime_reconciled,
+        ) {
+            policy_status = Some(PolicyStatusUpdate::unchanged_loaded(
+                version,
+                result.policy_hash.clone(),
+            ));
+            self.policy_version = version;
+        }
+
+        if reloads_gateway_policy
+            && !policy_runtime_changed
+            && let Some(generation) = self
+                .policy_generation
+                .as_ref()
+                .filter(|generation| !generation.is_stale())
+        {
+            // The same installed policy may serve a new attachment/configuration
+            // identity. Its generation is retained, never inferred from a cursor.
+            ctx.provider_readiness.policy_activated(
+                &desired_identity,
+                result.config_revision,
+                generation.clone(),
+            );
+        }
+
+        if policy_runtime_reconciled || provider_env_changed {
+            endpoint_status::reset(
+                ctx.endpoint_observation_tx.as_ref(),
+                self.endpoint_policy.as_ref(),
+                &self.policy_hash,
+                ctx.provider_credentials.snapshot().revision,
+            )
+            .await;
+        }
+
+        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
+        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
+
+        // Apply the agent-proposals feature toggle. On a false→true transition
+        // we lazily install the skill so a sandbox that started with the flag
+        // off picks up the surface without a recreate. We never uninstall on
+        // a true→false transition: stale skill content on disk is harmless
+        // because route_request and agent_next_steps both gate on the live
+        // shared flag, so the agent that reads the skill will see 404s and an
+        // empty `next_steps` array regardless.
+        apply_agent_proposals_enabled(
+            &ctx.agent_proposals,
+            agent_proposals_enabled_from_settings(&result.settings),
+            "settings poll",
+            Some(result.config_revision),
+            skills::install_static_skills,
+        );
+
+        Ok(Reconciled {
+            outcome: ReconcileOutcome::Applied,
+            policy_status,
+        })
+    }
+
+    /// Record a reconciled snapshot as applied.
+    fn commit(&mut self, result: openshell_core::grpc_client::SettingsPollResult) {
+        if self.reloads_gateway_policy {
+            self.applied_revision = Some(sandbox_config_revision(&result));
+        }
+        self.config_revision = result.config_revision;
+        if !self.reloads_gateway_policy {
+            self.policy_hash = result.policy_hash;
+        }
+        self.settings = result.settings;
+    }
+
+    /// Fetch and prepare the provider environment a polled snapshot requests.
+    async fn fetch_provider_environment<C: PolicyGatewayClient>(
+        &self,
+        ctx: &PolicyPollLoopContext,
+        client: &C,
+        result: &openshell_core::grpc_client::SettingsPollResult,
+        desired_identity: &EnvironmentIdentity,
+    ) -> std::result::Result<CapturedProviderEnvironment, ConfigRejection> {
+        ctx.provider_readiness.credentials_failed(
+            desired_identity.clone(),
+            ProviderReadinessReason::WaitingForCredentials,
+        );
+        let provider = match client
+            .fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id)
+            .await
+        {
+            Ok(provider)
+                if EnvironmentIdentity::from_environment(&provider) == *desired_identity
+                    && provider_environment_is_installable(provider.readiness_reason) =>
+            {
+                provider
+            }
+            failed => {
+                let reason = match failed {
+                    Ok(provider)
+                        if provider.readiness_reason != ProviderReadinessReason::Unspecified =>
+                    {
+                        provider.readiness_reason
+                    }
+                    Ok(_) => ProviderReadinessReason::SnapshotMismatch,
+                    Err(_) => ProviderReadinessReason::CredentialInstallFailed,
+                };
+                self.revoke_provider_environment(
+                    ctx,
+                    desired_identity.clone(),
+                    reason,
+                    result.provider_env_revision,
+                )
+                .await;
+                let error = "Provider environment is unavailable or changed during preparation";
+                return Err(ConfigRejection {
+                    code: "provider_environment_unavailable",
+                    detail: error.to_string(),
+                    admission_error: error.to_string(),
+                });
+            }
+        };
+        if let Ok(prepared) = CapturedProviderEnvironment::prepare(&provider) {
+            return Ok(prepared);
+        }
+        self.reject_provider_bindings(ctx, desired_identity.clone(), provider)
+            .await;
+        let error = "Provider environment bindings failed validation";
+        Err(ConfigRejection {
+            code: "invalid_provider_environment",
+            detail: error.to_string(),
+            admission_error: error.to_string(),
+        })
+    }
+
+    /// Revoke static provider credentials after the requested environment
+    /// could not be obtained. Previous dynamic grants remain active.
+    async fn revoke_provider_environment(
+        &self,
+        ctx: &PolicyPollLoopContext,
+        identity: EnvironmentIdentity,
+        reason: ProviderReadinessReason,
+        revision: u64,
+    ) {
+        ctx.provider_readiness.credentials_failed(identity, reason);
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Disabled, "fail_closed")
+            .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
+            .build());
+        ctx.provider_credentials
+            .revoke_static_provider_environment(revision);
+        endpoint_status::reset(
+            ctx.endpoint_observation_tx.as_ref(),
+            self.endpoint_policy.as_ref(),
+            &self.policy_hash,
+            revision,
         )
         .await;
-        if let Some(provider) = stream_state
+    }
+
+    /// Revoke static credentials whose bindings failed validation while
+    /// keeping the environment's dynamic grants.
+    async fn reject_provider_bindings(
+        &self,
+        ctx: &PolicyPollLoopContext,
+        identity: EnvironmentIdentity,
+        provider: openshell_core::grpc_client::ProviderEnvironmentResult,
+    ) {
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Disabled, "fail_closed")
+            .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
+            .build());
+        ctx.provider_readiness
+            .credentials_failed(identity, ProviderReadinessReason::CredentialInstallFailed);
+        let revision = provider.provider_env_revision;
+        // Repeat the rejected binding validation on the live state to
+        // revoke static material and retain the fetched dynamic grants.
+        let _ = ctx.provider_credentials.install_bound_environment(
+            provider.provider_env_revision,
+            provider.environment,
+            provider.credential_expires_at_ms,
+            provider.dynamic_credentials,
+            provider.static_credential_bindings,
+            provider.non_secret_environment_keys,
+        );
+        endpoint_status::reset(
+            ctx.endpoint_observation_tx.as_ref(),
+            self.endpoint_policy.as_ref(),
+            &self.policy_hash,
+            revision,
+        )
+        .await;
+    }
+
+    /// Apply one payload delivered over the supervisor session and answer it.
+    async fn apply_delivered<C: PolicyGatewayClient>(
+        &mut self,
+        ctx: &PolicyPollLoopContext,
+        client: &C,
+        request: ConfigApplyRequest,
+    ) {
+        use openshell_core::proto::config_update;
+
+        match request {
+            ConfigApplyRequest::Bootstrap {
+                bootstrap,
+                response,
+            } => {
+                let provider = match bootstrap.provider_environment {
+                    Some(snapshot) => Some(self.stage_delivered_provider(ctx, snapshot).await),
+                    None => None,
+                };
+                let sandbox = match bootstrap.sandbox_config {
+                    Some(snapshot) => Some(
+                        self.apply_delivered_sandbox(ctx, client, snapshot.into())
+                            .await,
+                    ),
+                    None => None,
+                };
+                let _ = response.send(bootstrap_result(
+                    provider,
+                    sandbox,
+                    self.stream.pending_provider.is_none(),
+                ));
+            }
+            ConfigApplyRequest::Update { update, response } => {
+                let (result, admission) = match update.component {
+                    Some(config_update::Component::SandboxConfig(snapshot)) => {
+                        let (result, admission) = self
+                            .apply_delivered_sandbox(ctx, client, snapshot.into())
+                            .await;
+                        (result, Some(admission))
+                    }
+                    Some(config_update::Component::ProviderEnvironment(snapshot)) => {
+                        let mut result = self.stage_delivered_provider(ctx, snapshot).await;
+                        if is_awaiting_component(&result)
+                            && let Some(sandbox) = self.stream.pending_sandbox.take()
+                        {
+                            let (sandbox_result, _) =
+                                self.apply_delivered_sandbox(ctx, client, *sandbox).await;
+                            result = provider_applied_with_sandbox(
+                                result,
+                                &sandbox_result,
+                                self.stream.pending_provider.is_none(),
+                            );
+                        }
+                        (result, None)
+                    }
+                    None => (
+                        config_apply_result(
+                            openshell_core::proto::ConfigComponent::Unspecified,
+                            None,
+                            None,
+                            openshell_core::proto::ConfigApplyOutcome::Unsupported,
+                            Some((
+                                "unsupported_component",
+                                "configuration update has no supported component",
+                                false,
+                            )),
+                        ),
+                        None,
+                    ),
+                };
+                let _ = response.send(openshell_core::proto::ConfigUpdateResult {
+                    update_id: update.update_id,
+                    component_sequence: update.component_sequence,
+                    result: Some(result),
+                    admission,
+                });
+            }
+        }
+    }
+
+    /// Apply a delivered sandbox configuration. Unless the provider
+    /// environment it names is installed, it waits for that snapshot.
+    async fn apply_delivered_sandbox<C: PolicyGatewayClient>(
+        &mut self,
+        ctx: &PolicyPollLoopContext,
+        client: &C,
+        snapshot: openshell_core::grpc_client::SettingsPollResult,
+    ) -> (
+        openshell_core::proto::ConfigComponentApplyResult,
+        openshell_core::proto::SandboxConfigurationAdmission,
+    ) {
+        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
+
+        let requested_revision = sandbox_config_revision(&snapshot);
+        let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
+        let provider = if !snapshot.configuration_admitted {
+            // A rejected generation supersedes one waiting for its provider.
+            self.stream.pending_sandbox = None;
+            if self.reloads_gateway_policy
+                && let Some(rejected) = self.stream.rejected_sandbox.as_ref()
+                && rejected.matches(&snapshot, &requested_revision, &desired_environment)
+            {
+                return (rejected.result.clone(), config_admission(&snapshot, false));
+            }
+            None
+        } else if desired_environment == self.stream.active_environment {
+            None
+        } else if let Some(provider) = self
+            .stream
             .pending_provider
             .as_ref()
             .filter(|provider| provider.identity == desired_environment)
         {
-            ctx.provider_credentials
-                .install_prepared(&provider.credentials);
-            ctx.provider_readiness.credentials_installed(
-                provider.identity.clone(),
-                &ctx.provider_credentials,
-                provider.expires_at_ms,
+            Some(provider.clone())
+        } else {
+            let admission = config_admission(&snapshot, false);
+            self.stream.pending_sandbox = Some(Box::new(snapshot));
+            return (
+                config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    Some(requested_revision),
+                    None,
+                    ConfigApplyOutcome::AwaitingComponent,
+                    None,
+                ),
+                admission,
             );
-            stream_state.active_environment = desired_environment.clone();
-            *current_provider_env_revision = desired_environment.revision;
-            stream_state.pending_provider = None;
-        }
-        Ok(ConfigApplyOutcome::RetainedLocalOverride)
-    };
+        };
 
-    match outcome {
-        Ok(outcome) => {
-            stream_state.rejected_sandbox = None;
-            if let Ok(generation) = ctx
-                .opa_engine
-                .generation_guard(ctx.opa_engine.current_generation())
-            {
-                // Provider-only and settings-only updates retain the compiled
-                // policy generation, but readiness still needs to bind that
-                // generation to the newly admitted environment identity.
-                ctx.provider_readiness.policy_activated(
-                    &desired_environment,
-                    snapshot.config_revision,
-                    generation,
+        let consumes_provider = provider.is_some();
+        let rejection = match self
+            .reconcile(ctx, client, &snapshot, ProviderSource::Delivered(provider))
+            .await
+        {
+            Ok(Reconciled {
+                outcome: ReconcileOutcome::Rejected(rejection),
+                ..
+            }) => rejection,
+            Ok(Reconciled { outcome, .. }) => {
+                if consumes_provider {
+                    self.stream.active_environment = desired_environment;
+                    self.stream.pending_provider = None;
+                }
+                self.stream.pending_sandbox = None;
+                self.stream.rejected_sandbox = None;
+                self.stream.degraded_startup = None;
+                let _ = ctx.workspace_tx.send(snapshot.workspace.clone());
+                let (outcome, applied_revision) = if !self.reloads_gateway_policy {
+                    (ConfigApplyOutcome::RetainedLocalOverride, None)
+                } else if matches!(outcome, ReconcileOutcome::Unchanged) {
+                    (
+                        ConfigApplyOutcome::IgnoredDuplicate,
+                        Some(requested_revision.clone()),
+                    )
+                } else {
+                    (
+                        ConfigApplyOutcome::Applied,
+                        Some(requested_revision.clone()),
+                    )
+                };
+                let admission = config_admission(&snapshot, true);
+                self.commit(snapshot);
+                let result = config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    Some(requested_revision),
+                    applied_revision,
+                    outcome,
+                    None,
                 );
+                return (result, admission);
             }
-            let _ = ctx.workspace_tx.send(snapshot.workspace.clone());
-            log_setting_changes(current_settings, &snapshot.settings);
-            apply_ocsf_json_setting(&ctx.ocsf_enabled, &snapshot.settings);
-            apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &snapshot.settings);
-            apply_agent_proposals_enabled(
-                &ctx.agent_proposals,
-                agent_proposals_enabled_from_settings(&snapshot.settings),
-                "stream snapshot",
-                Some(snapshot.config_revision),
-                skills::install_static_skills,
-            );
-            *current_settings = snapshot.settings;
-            stream_state.pending_sandbox = None;
-            *current_config_revision = snapshot.config_revision;
-            if snapshot.version > 0 && snapshot.policy_source == PolicySource::Sandbox {
-                *current_policy_version = snapshot.version;
+            Err(error) => {
+                let result = config_apply_result(
+                    ConfigComponent::SandboxConfig,
+                    Some(requested_revision),
+                    None,
+                    ConfigApplyOutcome::FailedClosed,
+                    Some(("configuration_rejected", &error.to_string(), true)),
+                );
+                return (result, config_admission(&snapshot, false));
             }
-            let applied_revision = (outcome != ConfigApplyOutcome::RetainedLocalOverride)
-                .then_some(requested_revision.clone());
-            if let Some(applied_revision) = applied_revision.as_ref() {
-                *current_stream_revision = Some(applied_revision.clone());
-            }
-            if outcome == ConfigApplyOutcome::Applied {
-                current_endpoint_policy.clone_from(&snapshot.policy);
-            }
-            if outcome == ConfigApplyOutcome::Applied || environment_changed {
-                endpoint_status::reset(
-                    ctx.endpoint_observation_tx.as_ref(),
-                    current_endpoint_policy.as_ref(),
-                    current_policy_hash,
-                    ctx.provider_credentials.snapshot().revision,
-                )
-                .await;
-            }
-            config_apply_result(
-                ConfigComponent::SandboxConfig,
+        };
+
+        // The previous revision is retained only while its policy is enforced.
+        let retained_revision = self
+            .applied_revision
+            .clone()
+            .filter(|_| ctx.opa_engine.fail_closed_reason().is_none());
+        let outcome = if retained_revision.is_some() {
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        } else {
+            ConfigApplyOutcome::FailedClosed
+        };
+        let detail = if rejection.detail.is_empty() {
+            "effective configuration was rejected by the gateway"
+        } else {
+            &rejection.detail
+        };
+        let result = config_apply_result(
+            ConfigComponent::SandboxConfig,
+            Some(requested_revision.clone()),
+            retained_revision,
+            outcome,
+            Some((rejection.code, detail, true)),
+        );
+        let admission = config_admission(&snapshot, false);
+        if !snapshot.configuration_admitted {
+            self.stream.rejected_sandbox = Some(Box::new(RejectedStreamSandbox {
+                configuration_instance_id: snapshot.configuration_instance_id.clone(),
                 requested_revision,
-                applied_revision,
-                outcome,
-                None,
-            )
+                environment: desired_environment,
+                error: snapshot.configuration_error.clone(),
+                failure_mode: snapshot.policy_validation_failure_mode,
+                result: result.clone(),
+            }));
+        } else if consumes_provider {
+            // Retry when the matching provider snapshot is delivered again.
+            self.stream.pending_sandbox = Some(Box::new(snapshot));
         }
-        Err((outcome, error)) => {
-            if stream_state
-                .pending_provider
-                .as_ref()
-                .is_some_and(|provider| {
-                    provider.identity == EnvironmentIdentity::from_settings(&snapshot_for_retry)
-                })
-            {
-                stream_state.pending_sandbox = Some(snapshot_for_retry);
-            }
-            let applied_revision = (outcome == ConfigApplyOutcome::FailedRetainedLastKnownGood)
-                .then_some(current_stream_revision.clone())
-                .flatten();
-            config_apply_result(
-                ConfigComponent::SandboxConfig,
-                requested_revision,
-                applied_revision,
-                outcome,
-                Some(("runtime_apply_failed", error, true)),
-            )
+        (result, admission)
+    }
+
+    /// Stage a delivered provider environment until the sandbox configuration
+    /// that names it arrives. An environment that cannot be installed revokes
+    /// static credentials, as a failed refresh does when polling.
+    async fn stage_delivered_provider(
+        &mut self,
+        ctx: &PolicyPollLoopContext,
+        snapshot: openshell_core::proto::ProviderEnvironmentSnapshot,
+    ) -> openshell_core::proto::ConfigComponentApplyResult {
+        use openshell_core::proto::{ConfigApplyOutcome, ConfigComponent};
+
+        let requested_revision = provider_config_revision(snapshot.provider_env_revision);
+        let identity = EnvironmentIdentity {
+            attachment_epoch: snapshot.provider_attachment_epoch.clone(),
+            revision: snapshot.provider_env_revision,
+            policy_hash: snapshot.policy_hash.clone(),
+        };
+        if identity == self.stream.active_environment {
+            return config_apply_result(
+                ConfigComponent::ProviderEnvironment,
+                Some(requested_revision.clone()),
+                Some(requested_revision),
+                ConfigApplyOutcome::IgnoredDuplicate,
+                None,
+            );
+        }
+        // A newer component delivery supersedes any older unmatched provider
+        // snapshot. Never let a later sandbox delivery commit stale credentials.
+        self.stream.pending_provider = None;
+        let revision = identity.revision;
+        let failure =
+            match openshell_core::grpc_client::ProviderEnvironmentResult::try_from(snapshot) {
+                Err(error) => {
+                    self.revoke_provider_environment(
+                        ctx,
+                        identity,
+                        ProviderReadinessReason::CredentialInstallFailed,
+                        revision,
+                    )
+                    .await;
+                    ("invalid_provider_environment", error.to_string(), false)
+                }
+                Ok(provider) if !provider_environment_is_installable(provider.readiness_reason) => {
+                    self.revoke_provider_environment(
+                        ctx,
+                        identity,
+                        provider.readiness_reason,
+                        revision,
+                    )
+                    .await;
+                    (
+                        "provider_environment_unavailable",
+                        "provider environment is not ready for installation".to_string(),
+                        true,
+                    )
+                }
+                Ok(provider) => match CapturedProviderEnvironment::prepare(&provider) {
+                    Ok(prepared) => {
+                        self.stream.pending_provider = Some(prepared);
+                        // The provider environment waits for its matching
+                        // admitted sandbox configuration.
+                        return config_apply_result(
+                            ConfigComponent::ProviderEnvironment,
+                            Some(requested_revision),
+                            None,
+                            ConfigApplyOutcome::AwaitingComponent,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        self.reject_provider_bindings(ctx, identity, provider).await;
+                        ("invalid_provider_environment", error.to_string(), false)
+                    }
+                },
+            };
+        // The revoked credentials no longer match any delivered environment.
+        self.stream.active_environment = EnvironmentIdentity::default();
+        let (code, message, retryable) = failure;
+        config_apply_result(
+            ConfigComponent::ProviderEnvironment,
+            Some(requested_revision),
+            None,
+            ConfigApplyOutcome::FailedClosed,
+            Some((code, &message, retryable)),
+        )
+    }
+
+    /// Retry the middleware registry of a startup configuration that could
+    /// not reach its services.
+    async fn retry_degraded_startup<C: PolicyGatewayClient>(
+        &mut self,
+        ctx: &PolicyPollLoopContext,
+        client: &C,
+    ) {
+        let Some(snapshot) = self.stream.degraded_startup.take() else {
+            return;
+        };
+        match self
+            .reconcile(ctx, client, &snapshot, ProviderSource::Delivered(None))
+            .await
+        {
+            Ok(Reconciled {
+                outcome: ReconcileOutcome::Applied | ReconcileOutcome::Unchanged,
+                ..
+            }) => self.commit(*snapshot),
+            _ => self.stream.degraded_startup = Some(snapshot),
         }
     }
 }
@@ -5311,9 +5717,6 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     mut ctx: PolicyPollLoopContext,
     client: C,
 ) -> Result<()> {
-    use openshell_core::proto::PolicySource;
-    use std::sync::atomic::Ordering;
-
     let mut config_apply_rx = ctx.config_apply_rx.take();
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
@@ -5340,53 +5743,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let mut config_apply_enabled = config_apply_updates
         .as_ref()
         .is_none_or(|updates| *updates.borrow());
-    let mut current_config_revision: u64 = initial_stream_snapshot
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.config_revision);
-    let mut current_stream_sandbox_revision = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map(sandbox_config_revision)
-        .filter(|_| ctx.loaded_policy_origin.allows_gateway_policy_reload());
-    let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
-    let mut current_policy_version: u32 = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map_or(0, |snapshot| snapshot.version);
-    let mut current_policy_hash = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map_or_else(String::new, |snapshot| snapshot.policy_hash.clone());
-    let mut current_policy_generation = None;
-    let mut current_endpoint_policy = ctx.endpoint_policy.clone();
-    let mut current_middleware_services = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map_or_else(Vec::new, |snapshot| {
-            snapshot.supervisor_middleware_services.clone()
-        });
-    let mut current_extension_authentication_enabled = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map_or(ctx.extension_authentication_enabled, |snapshot| {
-            snapshot.extension_authentication_enabled
-        });
-    let mut middleware_registry_status = ctx.middleware_registry_status;
-    let mut current_settings: std::collections::HashMap<
-        String,
-        openshell_core::proto::EffectiveSetting,
-    > = initial_stream_snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.configuration_admitted)
-        .map_or_else(std::collections::HashMap::new, |snapshot| {
-            snapshot.settings.clone()
-        });
-    let mut stream_configuration_state =
-        StreamConfigurationState::new(initial_stream_snapshot.as_ref());
-    let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
-    let mut last_failed_runtime_revision: Option<FailedRuntimeRevision> = None;
-    let mut rejected_policy_generation: Option<RejectedPolicyGeneration> = None;
-    let mut has_last_valid_policy = ctx.loaded_policy_origin.has_last_valid_policy();
+    let mut runtime = ConfigRuntime::new(&ctx, initial_stream_snapshot.as_ref());
 
     // A first poll that does not match the policy already loaded into OPA must
     // pass through the normal reconciliation path immediately. It must never
@@ -5412,15 +5769,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 snapshot.config_revision,
                 generation.clone(),
             );
-            current_policy_generation = Some(generation);
+            runtime.policy_generation = Some(generation);
         }
         apply_ocsf_json_setting(&ctx.ocsf_enabled, &snapshot.settings);
         apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &snapshot.settings);
         if snapshot.configuration_admitted {
             endpoint_status::reset(
                 ctx.endpoint_observation_tx.as_ref(),
-                current_endpoint_policy.as_ref(),
-                &current_policy_hash,
+                runtime.endpoint_policy.as_ref(),
+                &runtime.policy_hash,
                 ctx.provider_credentials.snapshot().revision,
             )
             .await;
@@ -5434,7 +5791,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     initial_generation.as_ref(),
                 ) {
                     (InitialPollDisposition::Acknowledge(candidate), Some(generation))
-                        if middleware_registry_status == MiddlewareRegistryStatus::Synchronized
+                        if runtime.middleware_registry_status
+                            == MiddlewareRegistryStatus::Synchronized
                             && !generation.is_stale() =>
                     {
                         ctx.provider_readiness.policy_activated(
@@ -5442,7 +5800,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                             result.config_revision,
                             generation.clone(),
                         );
-                        current_policy_generation = Some(generation.clone());
+                        runtime.policy_generation = Some(generation.clone());
                         apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
                         apply_ocsf_schema_version_setting(
                             &ctx.ocsf_schema_version,
@@ -5455,27 +5813,27 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                             Some(candidate.config_revision),
                             skills::install_static_skills,
                         );
-                        current_config_revision = candidate.config_revision;
-                        current_policy_version = candidate.version;
-                        current_policy_hash.clone_from(&candidate.policy_hash);
-                        current_endpoint_policy.clone_from(&result.policy);
+                        runtime.config_revision = candidate.config_revision;
+                        runtime.policy_version = candidate.version;
+                        runtime.policy_hash.clone_from(&candidate.policy_hash);
+                        runtime.endpoint_policy.clone_from(&result.policy);
                         endpoint_status::reset(
                             ctx.endpoint_observation_tx.as_ref(),
-                            current_endpoint_policy.as_ref(),
-                            &current_policy_hash,
+                            runtime.endpoint_policy.as_ref(),
+                            &runtime.policy_hash,
                             ctx.provider_credentials.snapshot().revision,
                         )
                         .await;
-                        current_middleware_services = result.supervisor_middleware_services;
-                        current_extension_authentication_enabled =
+                        runtime.middleware_services = result.supervisor_middleware_services;
+                        runtime.extension_authentication_enabled =
                             result.extension_authentication_enabled;
-                        current_settings = result.settings;
+                        runtime.settings = result.settings;
                         enqueue_policy_status(
                             &status_sender,
                             PolicyStatusUpdate::initial_loaded(&candidate),
                         );
                         debug!(
-                            config_revision = current_config_revision,
+                            config_revision = runtime.config_revision,
                             "Settings poll: initial policy matches loaded revision"
                         );
                     }
@@ -5500,14 +5858,14 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                             Some(result.config_revision),
                             skills::install_static_skills,
                         );
-                        current_config_revision = result.config_revision;
-                        current_policy_hash = result.policy_hash.clone();
-                        current_middleware_services = result.supervisor_middleware_services;
-                        current_extension_authentication_enabled =
+                        runtime.config_revision = result.config_revision;
+                        runtime.policy_hash = result.policy_hash.clone();
+                        runtime.middleware_services = result.supervisor_middleware_services;
+                        runtime.extension_authentication_enabled =
                             result.extension_authentication_enabled;
-                        current_settings = result.settings;
+                        runtime.settings = result.settings;
                         debug!(
-                            config_revision = current_config_revision,
+                            config_revision = runtime.config_revision,
                             "Settings poll: tracking gateway config while preserving local policy override"
                         );
                     }
@@ -5541,31 +5899,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     let Some(request) = request else {
                         return Err(miette::miette!("stream configuration apply channel closed"));
                     };
-                    apply_stream_config_request(
-                        &ctx,
-                        &client,
-                        request,
-                        &mut current_config_revision,
-                        &mut current_stream_sandbox_revision,
-                        &mut current_provider_env_revision,
-                        &mut current_policy_version,
-                        &mut current_policy_hash,
-                        &mut current_endpoint_policy,
-                        &mut current_middleware_services,
-                        &mut current_extension_authentication_enabled,
-                        &mut middleware_registry_status,
-                        &mut current_settings,
-                        &mut stream_configuration_state,
-                        reloads_gateway_policy,
-                        &mut has_last_valid_policy,
-                    ).await;
+                    runtime.apply_delivered(&ctx, &client, request).await;
                 }
                 () = tokio::time::sleep(delay) => {
-                    if current_extension_authentication_enabled
+                    if runtime.extension_authentication_enabled
                         && let Err(error) = client.refresh_installed_extension_credentials().await
                     {
                         warn!(error = %error, "Extension credential refresh failed");
                     }
+                    runtime.retry_degraded_startup(&ctx, &client).await;
                 }
             }
             continue;
@@ -5577,24 +5919,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             tokio::select! {
                 request = receive_config_apply(&mut config_apply_rx) => {
                     if let Some(request) = request {
-                        apply_stream_config_request(
-                            &ctx,
-                            &client,
-                            request,
-                            &mut current_config_revision,
-                            &mut current_stream_sandbox_revision,
-                            &mut current_provider_env_revision,
-                            &mut current_policy_version,
-                            &mut current_policy_hash,
-                            &mut current_endpoint_policy,
-                            &mut current_middleware_services,
-                            &mut current_extension_authentication_enabled,
-                            &mut middleware_registry_status,
-                            &mut current_settings,
-                            &mut stream_configuration_state,
-                            reloads_gateway_policy,
-                            &mut has_last_valid_policy,
-                        ).await;
+                        runtime.apply_delivered(&ctx, &client, request).await;
                         continue;
                     }
                 }
@@ -5607,7 +5932,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
-                    if current_extension_authentication_enabled
+                    if runtime.extension_authentication_enabled
                         && let Err(refresh_error) =
                             client.refresh_installed_extension_credentials().await
                     {
@@ -5621,593 +5946,26 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             }
         };
 
-        // Reuse installed per-service credentials, rotating only when one is
-        // missing or due. Rotation happens on the existing gateway channel and
-        // updates slots in place, so it is independent of config revision and
-        // registry equality.
-        let middleware_credentials = if result.extension_authentication_enabled {
-            match client
-                .extension_credentials_for(&result.supervisor_middleware_services)
-                .await
-            {
-                Ok(credentials) => credentials,
-                Err(error) => {
-                    warn!(error = %error, "Settings poll: extension credential refresh failed");
-                    std::collections::HashMap::new()
-                }
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
-
-        if reloads_gateway_policy && !result.configuration_admitted {
-            let disposition = apply_policy_validation_failure(
-                &ctx.opa_engine,
-                result.policy_validation_failure_mode,
-                has_last_valid_policy,
-                result.version,
-                &result.configuration_error,
-            )?;
-            emit_policy_validation_failure(
-                &disposition,
-                result.version,
-                &result.policy_hash,
-                &result.configuration_error,
-            );
-            rejected_policy_generation = Some(RejectedPolicyGeneration {
-                version: result.version,
-                policy_hash: result.policy_hash.clone(),
-                validation_error: result.configuration_error.clone(),
-                configured_mode: result.policy_validation_failure_mode,
-            });
-            report_runtime_configuration(&ctx, &result, false, &result.configuration_error).await;
-            continue;
+        let reconciled = runtime
+            .reconcile(&ctx, &client, &result, ProviderSource::Fetch)
+            .await?;
+        if let Some(status) = reconciled.policy_status {
+            enqueue_policy_status(&status_sender, status);
         }
-
-        let config_changed = result.config_revision != current_config_revision;
-        let desired_identity = EnvironmentIdentity::from_settings(&result);
-        let provider_env_changed = result.provider_env_revision != current_provider_env_revision
-            || ctx.provider_readiness.needs_environment(&desired_identity);
-        let policy_changed = result.policy_hash != current_policy_hash;
-        let extension_authentication_changed =
-            current_extension_authentication_enabled != result.extension_authentication_enabled;
-        let middleware_registry_changed = extension_authentication_changed
-            || middleware_registry_needs_rebuild(
-                middleware_registry_status,
-                &current_middleware_services,
-                &result.supervisor_middleware_services,
-            );
-        // A valid candidate may intentionally restore byte-for-byte policy
-        // content that was active before a rejected update. Its hash then
-        // equals `current_policy_hash`, but the runtime is still quarantined
-        // and must reload (or it would remain deny-all indefinitely).
-        let recovering_rejected_policy = reloads_gateway_policy
-            && rejected_policy_generation.is_some()
-            && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy
-            && (provider_env_changed
-                || current_policy_generation
-                    .as_ref()
-                    .is_some_and(PolicyGenerationGuard::is_stale)))
-            || recovering_rejected_policy
-            || extension_authentication_changed
-            || gateway_policy_runtime_needs_reconciliation(
-                reloads_gateway_policy,
-                &current_policy_hash,
-                &result.policy_hash,
-                &current_middleware_services,
-                &result.supervisor_middleware_services,
-                middleware_registry_status,
-            );
-        // Recovery already has its own acknowledgement path below. Giving it
-        // precedence here prevents a restored last-known-good policy from
-        // also being acknowledged as an ordinary same-hash revision.
-        let unchanged_policy_revision = unchanged_policy_revision_candidate(
-            reloads_gateway_policy,
-            recovering_rejected_policy,
-            current_policy_version,
-            &current_policy_hash,
-            &result,
-        );
-        let mut policy_runtime_reconciled = false;
-
-        // A local policy override is not coupled to the gateway policy
-        // snapshot, so its service registry can still be reconciled alone.
-        // Gateway policy snapshots, however, must install policy and registry
-        // as one generation below.
-        if !reloads_gateway_policy {
-            reconcile_middleware_registry(
-                &ctx.opa_engine,
-                &ctx.middleware_connector,
-                MiddlewareRegistryReconciliation {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    extension_credentials: &ctx.extension_credentials,
-                    current_services: &mut current_middleware_services,
-                    status: &mut middleware_registry_status,
-                },
-            )
-            .await;
-            if middleware_registry_status == MiddlewareRegistryStatus::Synchronized {
-                current_extension_authentication_enabled = result.extension_authentication_enabled;
-            }
-        }
-
-        if !config_changed
-            && !provider_env_changed
-            && !policy_runtime_changed
-            && unchanged_policy_revision.is_none()
-        {
-            continue;
-        }
-
-        if config_changed || provider_env_changed {
-            // Log which settings changed.
-            log_setting_changes(&current_settings, &result.settings);
-
-            // A posture change after a rejected update takes effect immediately.
-            // The compiled last-known-good engine remains available beneath a
-            // fail-closed quarantine, so an explicit retain_last_valid selection
-            // can reactivate it without accepting any part of the invalid policy.
-            if !policy_changed && let Some(rejected) = rejected_policy_generation.as_mut() {
-                let mode = result.policy_validation_failure_mode;
-                if mode != rejected.configured_mode {
-                    let disposition = apply_policy_validation_failure(
-                        &ctx.opa_engine,
-                        mode,
-                        has_last_valid_policy,
-                        rejected.version,
-                        &rejected.validation_error,
-                    )?;
-                    emit_policy_validation_failure(
-                        &disposition,
-                        rejected.version,
-                        &rejected.policy_hash,
-                        &rejected.validation_error,
-                    );
-                    rejected.configured_mode = mode;
-                }
-            }
-
-            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Other, "detected")
-                .unmapped("old_config_revision", serde_json::json!(current_config_revision))
-                .unmapped("new_config_revision", serde_json::json!(result.config_revision))
-                .unmapped("policy_changed", serde_json::json!(policy_changed))
-                .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
-                .message(format!(
-                    "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
-                    result.config_revision
-                ))
-                .build());
-        }
-
-        // Prepare the matching environment before activation. Failed refreshes
-        // revoke static credentials while preserving independently bound dynamic grants.
-        let mut prepared_identity = None;
-        let prepared_provider = if provider_env_changed {
-            ctx.provider_readiness.credentials_failed(
-                desired_identity.clone(),
-                ProviderReadinessReason::WaitingForCredentials,
-            );
-            let provider = match client
-                .fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id)
-                .await
-            {
-                Ok(provider)
-                    if EnvironmentIdentity::from_environment(&provider) == desired_identity
-                        && provider_environment_is_installable(provider.readiness_reason) =>
-                {
-                    provider
-                }
-                failed => {
-                    let reason = match failed {
-                        Ok(provider)
-                            if provider.readiness_reason
-                                != ProviderReadinessReason::Unspecified =>
-                        {
-                            provider.readiness_reason
-                        }
-                        Ok(_) => ProviderReadinessReason::SnapshotMismatch,
-                        Err(_) => ProviderReadinessReason::CredentialInstallFailed,
-                    };
-                    ctx.provider_readiness
-                        .credentials_failed(desired_identity.clone(), reason);
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::High)
-                        .status(StatusId::Failure)
-                        .state(StateId::Disabled, "fail_closed")
-                        .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
-                        .build());
-                    ctx.provider_credentials
-                        .revoke_static_provider_environment(result.provider_env_revision);
-                    endpoint_status::reset(
-                        ctx.endpoint_observation_tx.as_ref(),
-                        current_endpoint_policy.as_ref(),
-                        &current_policy_hash,
-                        result.provider_env_revision,
-                    )
+        match reconciled.outcome {
+            ReconcileOutcome::Unchanged => {}
+            ReconcileOutcome::Rejected(rejection) => {
+                report_runtime_configuration(&ctx, &result, false, &rejection.admission_error)
                     .await;
-                    report_runtime_configuration(
-                        &ctx,
-                        &result,
-                        false,
-                        "Provider environment is unavailable or changed during preparation",
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            if let Ok(prepared) = prepare_provider_environment(&provider) {
-                prepared_identity = Some((
-                    EnvironmentIdentity::from_environment(&provider),
-                    provider
-                        .credential_expires_at_ms
-                        .values()
-                        .copied()
-                        .filter(|expiry| *expiry > 0)
-                        .min(),
-                ));
-                Some(prepared)
-            } else {
-                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::High)
-                    .status(StatusId::Failure)
-                    .state(StateId::Disabled, "fail_closed")
-                    .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
-                    .build());
-                ctx.provider_readiness.credentials_failed(
-                    desired_identity.clone(),
-                    ProviderReadinessReason::CredentialInstallFailed,
-                );
-                // Repeat the rejected binding validation on the live state to
-                // revoke static material and retain the fetched dynamic grants.
-                let _ = ctx.provider_credentials.install_bound_environment(
-                    provider.provider_env_revision,
-                    provider.environment,
-                    provider.credential_expires_at_ms,
-                    provider.dynamic_credentials,
-                    provider.static_credential_bindings,
-                    provider.non_secret_environment_keys,
-                );
-                endpoint_status::reset(
-                    ctx.endpoint_observation_tx.as_ref(),
-                    current_endpoint_policy.as_ref(),
-                    &current_policy_hash,
-                    result.provider_env_revision,
-                )
-                .await;
-                report_runtime_configuration(
-                    &ctx,
-                    &result,
-                    false,
-                    "Provider environment bindings failed validation",
-                )
-                .await;
-                continue;
             }
-        } else {
-            None
-        };
-
-        if policy_runtime_changed {
-            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
-                result.policy.as_ref(),
-                pid,
-                MiddlewareReloadContext {
-                    desired_services: &result.supervisor_middleware_services,
-                    authentication: &MiddlewareAuthentication {
-                        credentials: middleware_credentials.clone(),
-                        enabled: result.extension_authentication_enabled,
-                    },
-                    registry_changed: middleware_registry_changed,
-                    connector: &ctx.middleware_connector,
-                },
-                ctx.transparent_tcp,
-                ctx.vm_identity,
-                || {
-                    if let Some(prepared) = prepared_provider.as_ref() {
-                        ctx.provider_credentials.install_prepared(prepared);
-                    }
-                },
-            )
-            .await;
-
-            match runtime_result {
-                Ok(generation) => {
-                    policy_runtime_reconciled = true;
-                    if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
-                        ctx.provider_readiness.credentials_installed(
-                            identity.clone(),
-                            &ctx.provider_credentials,
-                            *expires_at_ms,
-                        );
-                    }
-                    ctx.provider_readiness.policy_activated(
-                        &desired_identity,
-                        result.config_revision,
-                        generation.clone(),
-                    );
-                    current_policy_generation = Some(generation);
-                    let policy = result
-                        .policy
-                        .as_ref()
-                        .expect("successful runtime reload requires a policy payload");
-                    has_last_valid_policy = true;
-                    rejected_policy_generation = None;
-                    if policy_changed {
-                        if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
-                            policy_local_ctx.set_current_policy(policy.clone()).await;
-                        }
-                        if result.global_policy_version > 0 {
-                            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                .unmapped("global_version", serde_json::json!(result.global_policy_version))
-                                .message(format!(
-                                    "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
-                                    result.policy_hash,
-                                    result.global_policy_version
-                                ))
-                                .build());
-                        } else {
-                            ocsf_emit!(
-                                ConfigStateChangeBuilder::new(ocsf_ctx())
-                                    .severity(SeverityId::Informational)
-                                    .status(StatusId::Success)
-                                    .state(StateId::Enabled, "loaded")
-                                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                    .message(format!(
-                                        "Policy reloaded successfully [policy_hash:{}]",
-                                        result.policy_hash
-                                    ))
-                                    .build()
-                            );
-                        }
-                        if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                            enqueue_policy_status(
-                                &status_sender,
-                                PolicyStatusUpdate::loaded(result.version),
-                            );
-                            current_policy_version = result.version;
-                        }
-                    } else if recovering_rejected_policy
-                        && result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                    {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                                .message(format!(
-                                    "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
-                                    result.policy_hash
-                                ))
-                                .build()
-                        );
-                        enqueue_policy_status(
-                            &status_sender,
-                            PolicyStatusUpdate::loaded(result.version),
-                        );
-                        current_policy_version = result.version;
-                    }
-
-                    if middleware_registry_changed {
-                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "supervisor_middleware_service_count",
-                                serde_json::json!(result.supervisor_middleware_services.len())
-                            )
-                            .message(format!(
-                                "Supervisor policy runtime reloaded atomically [service_count:{}]",
-                                result.supervisor_middleware_services.len()
-                            ))
-                            .build());
-                    }
-
-                    current_policy_hash.clone_from(&result.policy_hash);
-                    current_endpoint_policy.clone_from(&result.policy);
-                    current_middleware_services.clone_from(&result.supervisor_middleware_services);
-                    current_extension_authentication_enabled =
-                        result.extension_authentication_enabled;
-                    retain_extension_credentials(
-                        &ctx.extension_credentials,
-                        &result.supervisor_middleware_services,
-                        result.extension_authentication_enabled,
-                    );
-                    middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-                    last_failed_runtime_revision = None;
-                }
-                Err(failure) => {
-                    ctx.provider_readiness
-                        .policy_install_failed(desired_identity.clone(), result.config_revision);
-                    let failed_revision = FailedRuntimeRevision::new(
-                        result.config_revision,
-                        &result.policy_hash,
-                        &failure,
-                    );
-                    if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
-                        let failure_mode = result.policy_validation_failure_mode;
-                        match apply_gateway_runtime_reload_failure(
-                            &ctx.opa_engine,
-                            failure,
-                            failure_mode,
-                            has_last_valid_policy,
-                            result.version,
-                        )? {
-                            GatewayRuntimeFailureDisposition::PolicyRejected {
-                                error,
-                                disposition,
-                            } => {
-                                emit_policy_validation_failure(
-                                    &disposition,
-                                    result.version,
-                                    &result.policy_hash,
-                                    &error,
-                                );
-                                rejected_policy_generation = Some(RejectedPolicyGeneration {
-                                    version: result.version,
-                                    policy_hash: result.policy_hash.clone(),
-                                    validation_error: error.clone(),
-                                    configured_mode: failure_mode,
-                                });
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    enqueue_policy_status(
-                                        &status_sender,
-                                        PolicyStatusUpdate::failed(result.version, error),
-                                    );
-                                }
-                            }
-                            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error } => {
-                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                                    .severity(SeverityId::Medium)
-                                    .status(StatusId::Failure)
-                                    .state(StateId::Other, "failed")
-                                    .unmapped("version", serde_json::json!(result.version))
-                                    .unmapped("error", serde_json::json!(&error))
-                                    .unmapped("previous_policy_active", serde_json::json!(true))
-                                    .message(format!(
-                                        "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
-                                        result.version
-                                    ))
-                                    .build());
-                            }
-                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                                error,
-                                active_generation,
-                            } => {
-                                emit_transparent_tcp_expansion_rejection(
-                                    result.version,
-                                    &result.policy_hash,
-                                    active_generation,
-                                    &error,
-                                );
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    enqueue_policy_status(
-                                        &status_sender,
-                                        PolicyStatusUpdate::failed(result.version, error),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    last_failed_runtime_revision = Some(failed_revision);
-                    // Nothing was installed, so the registry status still
-                    // describes the live registry. The retry is driven by the
-                    // persisting hash/service-set mismatch (or an existing
-                    // NeedsReconciliation), not by degrading the status here.
-                }
-            }
-        }
-
-        if policy_runtime_changed && !policy_runtime_reconciled {
-            report_runtime_configuration(&ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed").await;
-            continue;
-        }
-        if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
-            ctx.provider_credentials.install_prepared(prepared);
-            if let Some((identity, expires_at_ms)) = prepared_identity.as_ref() {
-                ctx.provider_readiness.credentials_installed(
-                    identity.clone(),
-                    &ctx.provider_credentials,
-                    *expires_at_ms,
-                );
-            }
-        }
-        if provider_env_changed || policy_runtime_reconciled {
-            current_provider_env_revision = result.provider_env_revision;
-        }
-
-        if let Some(version) = unchanged_policy_revision_ready_to_ack(
-            unchanged_policy_revision,
-            policy_runtime_changed,
-            policy_runtime_reconciled,
-        ) {
-            enqueue_policy_status(
-                &status_sender,
-                PolicyStatusUpdate::unchanged_loaded(version, result.policy_hash.clone()),
-            );
-            current_policy_version = version;
-        }
-
-        if reloads_gateway_policy
-            && !policy_runtime_changed
-            && let Some(generation) = current_policy_generation
-                .as_ref()
-                .filter(|generation| !generation.is_stale())
-        {
-            // The same installed policy may serve a new attachment/configuration
-            // identity. Its generation is retained, never inferred from a cursor.
-            ctx.provider_readiness.policy_activated(
-                &desired_identity,
-                result.config_revision,
-                generation.clone(),
-            );
-        }
-
-        if policy_runtime_reconciled || provider_env_changed {
-            endpoint_status::reset(
-                ctx.endpoint_observation_tx.as_ref(),
-                current_endpoint_policy.as_ref(),
-                &current_policy_hash,
-                ctx.provider_credentials.snapshot().revision,
-            )
-            .await;
-        }
-
-        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
-        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-        apply_ocsf_schema_version_setting(&ctx.ocsf_schema_version, &result.settings);
-
-        // Apply the agent-proposals feature toggle. On a false→true transition
-        // we lazily install the skill so a sandbox that started with the flag
-        // off picks up the surface without a recreate. We never uninstall on
-        // a true→false transition: stale skill content on disk is harmless
-        // because route_request and agent_next_steps both gate on the live
-        // shared flag, so the agent that reads the skill will see 404s and an
-        // empty `next_steps` array regardless.
-        apply_agent_proposals_enabled(
-            &ctx.agent_proposals,
-            agent_proposals_enabled_from_settings(&result.settings),
-            "settings poll",
-            Some(result.config_revision),
-            skills::install_static_skills,
-        );
-
-        if !report_runtime_configuration(&ctx, &result, true, "").await {
             // Retry the exact status tuple on the next poll before advancing
             // the observed revision; an old instance cannot claim readiness.
-            continue;
+            ReconcileOutcome::Applied => {
+                if report_runtime_configuration(&ctx, &result, true, "").await {
+                    runtime.commit(result);
+                }
+            }
         }
-        if reloads_gateway_policy && (!policy_runtime_changed || policy_runtime_reconciled) {
-            current_stream_sandbox_revision = Some(sandbox_config_revision(&result));
-        }
-        current_config_revision = result.config_revision;
-        if !reloads_gateway_policy {
-            current_policy_hash = result.policy_hash;
-        }
-        current_settings = result.settings;
     }
 }
 
@@ -10727,6 +10485,12 @@ network_policies:
         );
     }
 
+    fn outcome(
+        result: &openshell_core::proto::ConfigComponentApplyResult,
+    ) -> openshell_core::proto::ConfigApplyOutcome {
+        openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap()
+    }
+
     #[tokio::test]
     async fn duplicate_stream_snapshot_preserves_local_policy_override() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
@@ -10740,49 +10504,22 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut current_config_revision = 0;
-        let mut current_revision = None;
-        let mut version = 0;
-        let mut hash = String::new();
-        let mut services = Vec::new();
-        let mut auth_enabled = false;
-        let mut registry_status = MiddlewareRegistryStatus::Synchronized;
-        let mut settings = std::collections::HashMap::new();
-        let mut has_last_valid_policy = true;
         let initial_generation = engine.current_generation();
         let candidate =
             settings_poll_result(Some(proto_tcp_policy_fixture()), 2, PolicySource::Sandbox);
-        let mut stream_state = StreamConfigurationState::new(Some(&candidate));
-        let mut provider_revision = candidate.provider_env_revision;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&candidate));
+        // The first delivery is new to the runtime; the second is a duplicate.
+        runtime.config_revision = 0;
 
         for _ in 0..2 {
-            let result = apply_stream_sandbox_snapshot(
-                &ctx,
-                &client,
-                candidate.clone(),
-                &mut current_config_revision,
-                &mut current_revision,
-                &mut version,
-                &mut hash,
-                &mut None,
-                &mut services,
-                &mut auth_enabled,
-                &mut registry_status,
-                &mut settings,
-                &mut stream_state,
-                &mut provider_revision,
-                false,
-                &mut has_last_valid_policy,
-            )
-            .await;
+            let (result, _) = runtime
+                .apply_delivered_sandbox(&ctx, &client, candidate.clone())
+                .await;
 
             assert_eq!(engine.current_generation(), initial_generation);
-            assert_eq!(
-                ConfigApplyOutcome::try_from(result.outcome).unwrap(),
-                ConfigApplyOutcome::RetainedLocalOverride
-            );
+            assert_eq!(outcome(&result), ConfigApplyOutcome::RetainedLocalOverride);
             assert!(result.applied_revision.is_none());
-            assert!(current_revision.is_none());
+            assert!(runtime.applied_revision.is_none());
         }
     }
 
@@ -10820,51 +10557,31 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut config_revision = initial.config_revision;
         let initial_revision = sandbox_config_revision(&initial);
-        let mut stream_revision = Some(initial_revision.clone());
-        let mut policy_version = initial.version;
-        let mut policy_hash = initial.policy_hash.clone();
-        let mut middleware_services = Vec::new();
-        let mut extension_authentication_enabled = false;
-        let mut middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-        let mut settings = std::collections::HashMap::new();
-        let mut has_last_valid_policy = true;
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let _ = stage_stream_provider_snapshot(
-            provider_snapshot_for(&desired, "REGION", "west"),
-            &mut stream_state,
-        );
-        let mut provider_revision = initial.provider_env_revision;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let _ = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
 
-        let result = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired,
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut None,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
+        let (result, admission) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired)
+            .await;
 
-        assert_eq!(config_revision, initial.config_revision);
-        assert_eq!(policy_version, initial.version);
-        assert_eq!(policy_hash, initial.policy_hash);
+        assert_eq!(runtime.config_revision, initial.config_revision);
+        assert_eq!(runtime.policy_version, initial.version);
+        assert_eq!(runtime.policy_hash, initial.policy_hash);
         assert_eq!(result.applied_revision, Some(initial_revision));
         assert_eq!(
-            openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            outcome(&result),
             openshell_core::proto::ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
+        assert_eq!(
+            admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+        );
+        // A redelivered provider snapshot retries the held configuration.
+        assert!(runtime.stream.pending_sandbox.is_some());
+        assert!(runtime.stream.pending_provider.is_some());
     }
 
     fn provider_snapshot_for(
@@ -10928,38 +10645,20 @@ network_policies:
         ctx.ocsf_enabled.store(true, Ordering::Relaxed);
         ctx.agent_proposals.set_enabled(true);
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut current_settings = initial.settings.clone();
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let mut provider_revision = initial.provider_env_revision;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
         let initial_revision = sandbox_config_revision(&initial);
-        let result = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            rejected,
-            &mut initial.config_revision.clone(),
-            &mut Some(initial_revision.clone()),
-            &mut initial.version.clone(),
-            &mut initial.policy_hash.clone(),
-            &mut None,
-            &mut Vec::new(),
-            &mut false,
-            &mut MiddlewareRegistryStatus::Synchronized,
-            &mut current_settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut true,
-        )
-        .await;
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, rejected)
+            .await;
 
         assert_eq!(
-            ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            outcome(&result),
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
         assert_eq!(result.applied_revision, Some(initial_revision));
         assert!(ctx.ocsf_enabled.load(Ordering::Relaxed));
         assert!(ctx.agent_proposals.enabled());
-        assert_eq!(current_settings, initial.settings);
+        assert_eq!(runtime.settings, initial.settings);
     }
 
     #[tokio::test]
@@ -10988,23 +10687,21 @@ network_policies:
         let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         config_apply_tx
-            .send(
-                openshell_supervisor_process::supervisor_session::ConfigApplyRequest::Update {
-                    update: openshell_core::proto::ConfigUpdate {
-                        update_id: "provider-2".to_string(),
-                        component_sequence: 1,
-                        component: Some(
-                            openshell_core::proto::config_update::Component::ProviderEnvironment(
-                                openshell_core::proto::ProviderEnvironmentSnapshot {
-                                    provider_env_revision: 2,
-                                    ..Default::default()
-                                },
-                            ),
+            .send(ConfigApplyRequest::Update {
+                update: openshell_core::proto::ConfigUpdate {
+                    update_id: "provider-2".to_string(),
+                    component_sequence: 1,
+                    component: Some(
+                        openshell_core::proto::config_update::Component::ProviderEnvironment(
+                            openshell_core::proto::ProviderEnvironmentSnapshot {
+                                provider_env_revision: 2,
+                                ..Default::default()
+                            },
                         ),
-                    },
-                    response: response_tx,
+                    ),
                 },
-            )
+                response: response_tx,
+            })
             .await
             .unwrap();
         timeout(Duration::from_secs(1), response_rx)
@@ -11013,6 +10710,90 @@ network_policies:
             .expect("stream update responder stopped");
 
         assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+        handle.abort();
+    }
+
+    async fn deliver_update(
+        config_apply_tx: &tokio::sync::mpsc::Sender<ConfigApplyRequest>,
+        update_id: &str,
+        component: openshell_core::proto::config_update::Component,
+    ) -> openshell_core::proto::ConfigUpdateResult {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        config_apply_tx
+            .send(ConfigApplyRequest::Update {
+                update: openshell_core::proto::ConfigUpdate {
+                    update_id: update_id.to_string(),
+                    component_sequence: 1,
+                    component: Some(component),
+                },
+                response,
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("stream update timed out")
+            .expect("stream update responder stopped")
+    }
+
+    #[tokio::test]
+    async fn stream_policy_status_is_reported_only_in_acknowledgements() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource, config_update::Component};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let desired = settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.initial_stream_snapshot = Some(initial);
+        let (config_apply_tx, config_apply_rx) = tokio::sync::mpsc::channel(1);
+        ctx.config_apply_rx = Some(config_apply_rx);
+        let (client, _polls, mut reports) = scripted_policy_gateway();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+
+        let provider = deliver_update(
+            &config_apply_tx,
+            "provider-2",
+            Component::ProviderEnvironment(provider_snapshot_for(&desired, "REGION", "west")),
+        )
+        .await;
+        assert_eq!(
+            outcome(provider.result.as_ref().unwrap()),
+            ConfigApplyOutcome::AwaitingComponent
+        );
+        let sandbox = deliver_update(
+            &config_apply_tx,
+            "sandbox-2",
+            Component::SandboxConfig(openshell_core::proto::SandboxConfigSnapshot {
+                version: desired.version,
+                policy_hash: desired.policy_hash.clone(),
+                config_revision: desired.config_revision,
+                policy_source: PolicySource::Sandbox.into(),
+                policy: desired.policy.clone(),
+                configuration_admitted: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(
+            outcome(sandbox.result.as_ref().unwrap()),
+            ConfigApplyOutcome::Applied
+        );
+
+        // The acknowledgement carries the loaded policy version; the polling
+        // status RPC must not report it a second time.
+        assert!(
+            timeout(Duration::from_millis(200), reports.recv())
+                .await
+                .is_err()
+        );
         handle.abort();
     }
 
@@ -11083,36 +10864,18 @@ network_policies:
         let (client, _polls, _reports) = scripted_policy_gateway();
         let initial_revision = sandbox_config_revision(&initial);
         let initial_generation = engine.current_generation();
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let _ = stage_stream_provider_snapshot(
-            provider_snapshot_for(&candidate, "REGION", "west"),
-            &mut stream_state,
-        );
-        let mut provider_revision = initial.provider_env_revision;
-        let result = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            candidate,
-            &mut initial.config_revision.clone(),
-            &mut Some(initial_revision.clone()),
-            &mut initial.version.clone(),
-            &mut initial.policy_hash.clone(),
-            &mut None,
-            &mut Vec::new(),
-            &mut false,
-            &mut MiddlewareRegistryStatus::Synchronized,
-            &mut std::collections::HashMap::new(),
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut true,
-        )
-        .await;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let _ = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&candidate, "REGION", "west"))
+            .await;
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, candidate)
+            .await;
 
         assert_eq!(engine.current_generation(), initial_generation);
         assert!(engine.fail_closed_reason().is_none());
         assert_eq!(
-            ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            outcome(&result),
             ConfigApplyOutcome::FailedRetainedLastKnownGood
         );
         assert_eq!(result.applied_revision, Some(initial_revision));
@@ -11124,10 +10887,18 @@ network_policies:
                 .message
                 .contains("without the transparent TCP substrate")
         );
+        // Readiness reports the rejected generation rather than claiming the
+        // retained policy as evidence for it.
+        assert_eq!(
+            ctx.provider_readiness
+                .observation(&ctx.provider_credentials)
+                .reason,
+            i32::from(ProviderReadinessReason::PolicyActivationFailed)
+        );
     }
 
     #[tokio::test]
-    async fn stream_provider_rotation_rebinds_retained_policy_generation() {
+    async fn stream_provider_rotation_rebinds_policy_generation() {
         use openshell_core::proto::PolicySource;
 
         let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
@@ -11147,39 +10918,19 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let _ = stage_stream_provider_snapshot(
-            provider_snapshot_for(&desired, "REGION", "west"),
-            &mut stream_state,
-        );
-        let mut config_revision = initial.config_revision;
-        let mut stream_revision = Some(sandbox_config_revision(&initial));
-        let mut policy_version = initial.version;
-        let mut policy_hash = initial.policy_hash.clone();
-        let mut provider_revision = initial.provider_env_revision;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let _ = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
 
-        let applied = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut None,
-            &mut Vec::new(),
-            &mut false,
-            &mut MiddlewareRegistryStatus::Synchronized,
-            &mut std::collections::HashMap::new(),
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut true,
-        )
-        .await;
+        let (applied, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+            .await;
 
         assert!(config_apply_result_activates(&applied));
-        assert_eq!(ctx.opa_engine.current_generation(), initial_generation);
+        // As with polling, the credentials install with a fresh generation of
+        // the unchanged policy, and readiness binds to that generation.
+        assert!(ctx.opa_engine.current_generation() > initial_generation);
         let observed = ctx
             .provider_readiness
             .observation(&ctx.provider_credentials);
@@ -11215,14 +10966,13 @@ network_policies:
         );
         desired.provider_env_revision = 17;
         desired.provider_attachment_epoch = "epoch-b".to_string();
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let result = stage_stream_provider_snapshot(
-            provider_snapshot_for(&desired, "REGION", "west"),
-            &mut stream_state,
-        );
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let result = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
 
         assert_eq!(
-            openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            outcome(&result),
             openshell_core::proto::ConfigApplyOutcome::AwaitingComponent
         );
         assert!(result.failure.is_none());
@@ -11235,30 +10985,9 @@ network_policies:
         );
 
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut config_revision = initial.config_revision;
-        let mut stream_revision = Some(sandbox_config_revision(&initial));
-        let mut policy_version = initial.version;
-        let mut policy_hash = initial.policy_hash.clone();
-        let mut provider_revision = initial.provider_env_revision;
-        let applied = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut None,
-            &mut Vec::new(),
-            &mut false,
-            &mut MiddlewareRegistryStatus::Synchronized,
-            &mut std::collections::HashMap::new(),
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut true,
-        )
-        .await;
+        let (applied, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+            .await;
         assert!(config_apply_result_activates(&applied));
         let sandbox_revision_token = sandbox_config_revision(&desired);
         assert_eq!(
@@ -11266,7 +10995,7 @@ network_policies:
             Some(sandbox_revision_token.clone())
         );
         assert_eq!(applied.applied_revision, Some(sandbox_revision_token));
-        assert_eq!(provider_revision, 17);
+        assert_eq!(runtime.provider_env_revision, 17);
         assert_eq!(ctx.provider_credentials.snapshot().revision, 17);
         assert!(
             ctx.provider_credentials
@@ -11274,12 +11003,11 @@ network_policies:
                 .child_env
                 .contains_key("REGION")
         );
-        let provider_retry = stage_stream_provider_snapshot(
-            provider_snapshot_for(&desired, "REGION", "west"),
-            &mut stream_state,
-        );
+        let provider_retry = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
         assert_eq!(
-            openshell_core::proto::ConfigApplyOutcome::try_from(provider_retry.outcome).unwrap(),
+            outcome(&provider_retry),
             openshell_core::proto::ConfigApplyOutcome::IgnoredDuplicate
         );
         let provider_revision_token = provider_config_revision(17);
@@ -11316,49 +11044,23 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut config_revision = initial.config_revision;
-        let mut stream_revision = Some(sandbox_config_revision(&initial));
-        let mut policy_version = initial.version;
-        let mut policy_hash = initial.policy_hash.clone();
-        let mut middleware_services = Vec::new();
-        let mut extension_authentication_enabled = false;
-        let mut middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-        let mut settings = std::collections::HashMap::new();
-        let mut has_last_valid_policy = true;
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let _ = stage_stream_provider_snapshot(
-            provider_snapshot_for(&desired, "REGION", "west"),
-            &mut stream_state,
-        );
-        let mut provider_revision = initial.provider_env_revision;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let _ = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
 
-        let result = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut None,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+            .await;
 
-        assert_eq!(config_revision, desired.config_revision);
-        assert_eq!(policy_version, desired.version);
-        assert_eq!(policy_hash, desired.policy_hash);
+        assert_eq!(runtime.config_revision, desired.config_revision);
+        assert_eq!(runtime.policy_version, desired.version);
+        assert_eq!(runtime.policy_hash, desired.policy_hash);
         assert_eq!(
-            openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap(),
+            outcome(&result),
             openshell_core::proto::ConfigApplyOutcome::Applied
         );
+        assert_eq!(client.poll_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -11381,87 +11083,42 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut config_revision = initial.config_revision;
-        let mut stream_revision = Some(sandbox_config_revision(&initial));
-        let mut policy_version = initial.version;
-        let mut policy_hash = initial.policy_hash.clone();
-        let mut provider_revision = initial.provider_env_revision;
-        let mut stream_state = StreamConfigurationState::new(Some(&initial));
-        let mut endpoint_policy = None;
-        let mut middleware_services = Vec::new();
-        let mut extension_authentication_enabled = false;
-        let mut middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-        let mut current_settings = std::collections::HashMap::new();
-        let mut has_last_valid_policy = true;
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
 
-        let waiting = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut endpoint_policy,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut current_settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
-        assert_eq!(
-            ConfigApplyOutcome::try_from(waiting.outcome).unwrap(),
-            ConfigApplyOutcome::AwaitingComponent
-        );
+        let (waiting, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+            .await;
+        assert_eq!(outcome(&waiting), ConfigApplyOutcome::AwaitingComponent);
         assert!(waiting.failure.is_none());
-        assert!(stream_state.pending_sandbox.is_some());
+        assert!(runtime.stream.pending_sandbox.is_some());
         assert_eq!(ctx.provider_credentials.snapshot().revision, 0);
 
         let provider_revision_token = provider_config_revision(desired.provider_env_revision);
         let (response, receiver) = tokio::sync::oneshot::channel();
-        apply_stream_config_request(
-            &ctx,
-            &client,
-            openshell_supervisor_process::supervisor_session::ConfigApplyRequest::Update {
-                update: openshell_core::proto::ConfigUpdate {
-                    update_id: "provider-second".to_string(),
-                    component_sequence: 1,
-                    component: Some(
-                        openshell_core::proto::config_update::Component::ProviderEnvironment(
-                            provider_snapshot_for(&desired, "REGION", "west"),
+        runtime
+            .apply_delivered(
+                &ctx,
+                &client,
+                ConfigApplyRequest::Update {
+                    update: openshell_core::proto::ConfigUpdate {
+                        update_id: "provider-second".to_string(),
+                        component_sequence: 1,
+                        component: Some(
+                            openshell_core::proto::config_update::Component::ProviderEnvironment(
+                                provider_snapshot_for(&desired, "REGION", "west"),
+                            ),
                         ),
-                    ),
+                    },
+                    response,
                 },
-                response,
-            },
-            &mut config_revision,
-            &mut stream_revision,
-            &mut provider_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut endpoint_policy,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut current_settings,
-            &mut stream_state,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
+            )
+            .await;
         let provider_result = receiver
             .await
             .expect("provider result")
             .result
             .expect("provider component result");
-        assert_eq!(
-            ConfigApplyOutcome::try_from(provider_result.outcome).unwrap(),
-            ConfigApplyOutcome::Applied
-        );
+        assert_eq!(outcome(&provider_result), ConfigApplyOutcome::Applied);
         assert_eq!(
             provider_result.requested_revision,
             Some(provider_revision_token.clone())
@@ -11470,51 +11127,20 @@ network_policies:
             provider_result.applied_revision,
             Some(provider_revision_token)
         );
-        assert!(stream_state.pending_sandbox.is_none());
+        assert!(runtime.stream.pending_sandbox.is_none());
 
-        let applied = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            desired.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut endpoint_policy,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut current_settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
-        assert_eq!(
-            ConfigApplyOutcome::try_from(applied.outcome).unwrap(),
-            ConfigApplyOutcome::IgnoredDuplicate
-        );
+        let (applied, admission) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired.clone())
+            .await;
+        assert_eq!(outcome(&applied), ConfigApplyOutcome::IgnoredDuplicate);
         let desired_revision = sandbox_config_revision(&desired);
         assert_eq!(applied.requested_revision, Some(desired_revision.clone()));
         assert_eq!(applied.applied_revision, Some(desired_revision));
-        let admission = streamed_configuration_admission(
-            &openshell_core::proto::SandboxConfigSnapshot {
-                configuration_admitted: true,
-                configuration_instance_id: desired.configuration_instance_id.clone(),
-                version: desired.version,
-                policy_hash: desired.policy_hash.clone(),
-                config_revision: desired.config_revision,
-                provider_env_revision: desired.provider_env_revision,
-                ..Default::default()
-            },
-            true,
-        );
         assert_eq!(
             admission.state,
             i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
         );
-        assert_eq!(provider_revision, 23);
+        assert_eq!(runtime.provider_env_revision, 23);
         assert_eq!(ctx.provider_credentials.snapshot().revision, 23);
         assert!(
             ctx.provider_credentials
@@ -11548,67 +11174,271 @@ network_policies:
             default_middleware_connector(),
         );
         let (client, _polls, _reports) = scripted_policy_gateway();
-        let mut config_revision = 0;
-        let mut stream_revision = None;
-        let mut policy_version = 0;
-        let mut policy_hash = String::new();
-        let mut endpoint_policy = None;
-        let mut middleware_services = Vec::new();
-        let mut extension_authentication_enabled = false;
-        let mut middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
-        let mut current_settings = std::collections::HashMap::new();
-        let mut stream_state = StreamConfigurationState::new(None);
-        let mut provider_revision = 0;
-        let mut has_last_valid_policy = false;
+        let mut runtime = ConfigRuntime::new(&ctx, None);
 
-        let result = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            rejected.clone(),
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut endpoint_policy,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut current_settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, rejected.clone())
+            .await;
 
-        assert_eq!(
-            ConfigApplyOutcome::try_from(result.outcome).unwrap(),
-            ConfigApplyOutcome::FailedClosed
-        );
+        assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
         let rejected_generation = ctx.opa_engine.current_generation();
         assert!(rejected_generation > initial_generation);
 
-        let duplicate = apply_stream_sandbox_snapshot(
-            &ctx,
-            &client,
-            rejected,
-            &mut config_revision,
-            &mut stream_revision,
-            &mut policy_version,
-            &mut policy_hash,
-            &mut endpoint_policy,
-            &mut middleware_services,
-            &mut extension_authentication_enabled,
-            &mut middleware_registry_status,
-            &mut current_settings,
-            &mut stream_state,
-            &mut provider_revision,
-            true,
-            &mut has_last_valid_policy,
-        )
-        .await;
+        let (duplicate, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, rejected)
+            .await;
 
         assert_eq!(duplicate, result);
         assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
+    }
+
+    #[tokio::test]
+    async fn stream_snapshot_restoring_rejected_policy_clears_quarantine() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let mut rejected = initial.clone();
+        rejected.version = 2;
+        rejected.policy_hash = "hash-v2".to_string();
+        rejected.config_revision = 200;
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "invalid policy".to_string();
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        // A later generation restores byte-identical policy content.
+        let mut restored = initial.clone();
+        restored.version = 3;
+        restored.config_revision = 300;
+
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(
+            Arc::clone(&engine),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, rejected)
+            .await;
+        assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
+        assert!(engine.fail_closed_reason().is_some());
+        let quarantined_generation = engine.current_generation();
+
+        let (result, admission) = runtime
+            .apply_delivered_sandbox(&ctx, &client, restored.clone())
+            .await;
+        assert_eq!(outcome(&result), ConfigApplyOutcome::Applied);
+        assert_eq!(
+            result.applied_revision,
+            Some(sandbox_config_revision(&restored))
+        );
+        assert_eq!(
+            admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        );
+        // Matching policy bytes must not leave the runtime deny-all.
+        assert!(engine.fail_closed_reason().is_none());
+        assert!(engine.current_generation() > quarantined_generation);
+        assert_eq!(runtime.policy_version, restored.version);
+    }
+
+    #[tokio::test]
+    async fn failed_stream_provider_snapshot_revokes_static_credentials() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        for (revision, readiness_reason, classification, expected_code) in [
+            (
+                2,
+                ProviderReadinessReason::UnsupportedSupervisor,
+                openshell_core::proto::ProviderEnvironmentValueClassification::NonSecret,
+                "provider_environment_unavailable",
+            ),
+            (
+                3,
+                ProviderReadinessReason::Unspecified,
+                openshell_core::proto::ProviderEnvironmentValueClassification::Unspecified,
+                "invalid_provider_environment",
+            ),
+        ] {
+            ctx.provider_credentials = initial_provider_credentials(
+                static_provider_environment(1, Some("initial")),
+                &ctx.provider_readiness,
+            );
+            assert!(
+                ctx.provider_credentials
+                    .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                    .is_some()
+            );
+            let mut snapshot = provider_snapshot_for(&initial, "REGION", "west");
+            snapshot.provider_env_revision = revision;
+            snapshot.readiness_reason = readiness_reason.into();
+            snapshot.values[0].classification = classification.into();
+
+            let result = runtime.stage_delivered_provider(&ctx, snapshot).await;
+
+            assert_eq!(outcome(&result), ConfigApplyOutcome::FailedClosed);
+            assert_eq!(result.failure.as_ref().unwrap().code, expected_code);
+            assert!(runtime.stream.pending_provider.is_none());
+            assert!(ctx.provider_credentials.resolver().is_none());
+            assert!(
+                !ctx.provider_credentials
+                    .snapshot()
+                    .child_env
+                    .contains_key("EXTERNAL_TOKEN")
+            );
+            assert!(
+                !ctx.provider_readiness
+                    .observation(&ctx.provider_credentials)
+                    .credentials_installed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_snapshot_drops_credentials_of_removed_middleware() {
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let mut initial =
+            settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        initial.extension_authentication_enabled = true;
+        initial.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "removed-guard".to_string(),
+                grpc_endpoint: "http://removed.invalid".to_string(),
+                ..Default::default()
+            }];
+        let mut desired =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        desired.extension_authentication_enabled = true;
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let now_ms = openshell_core::time::now_ms();
+        ctx.extension_credentials
+            .install("removed-guard", "token", now_ms + 3_600_000, now_ms)
+            .expect("install extension credential");
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let _ = runtime
+            .stage_delivered_provider(&ctx, provider_snapshot_for(&desired, "REGION", "west"))
+            .await;
+
+        let (result, _) = runtime
+            .apply_delivered_sandbox(&ctx, &client, desired)
+            .await;
+
+        assert_eq!(outcome(&result), ConfigApplyOutcome::Applied);
+        assert!(runtime.middleware_services.is_empty());
+        assert!(ctx.extension_credentials.get("removed-guard").is_none());
+    }
+
+    #[tokio::test]
+    async fn degraded_stream_startup_retries_middleware_registry() {
+        use openshell_core::proto::PolicySource;
+
+        let mut initial =
+            settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        initial.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "late-guard".to_string(),
+                grpc_endpoint: "http://late.invalid".to_string(),
+                ..Default::default()
+            }];
+        let available = Arc::new(AtomicBool::new(false));
+        let connector_available = Arc::clone(&available);
+        let connector: MiddlewareConnector = Arc::new(move |_services, _authentication| {
+            let available = connector_available.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if available {
+                    connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
+                } else {
+                    Err(miette::miette!("middleware is still unavailable"))
+                }
+            })
+        });
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let mut ctx = policy_poll_test_context(
+            Arc::clone(&engine),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            connector,
+        );
+        ctx.middleware_registry_status = MiddlewareRegistryStatus::NeedsReconciliation;
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = ConfigRuntime::new(&ctx, Some(&initial));
+        let initial_generation = engine.current_generation();
+
+        runtime.retry_degraded_startup(&ctx, &client).await;
+        assert_eq!(
+            runtime.middleware_registry_status,
+            MiddlewareRegistryStatus::NeedsReconciliation
+        );
+        assert!(runtime.stream.degraded_startup.is_some());
+        assert_eq!(engine.current_generation(), initial_generation);
+
+        available.store(true, Ordering::SeqCst);
+        runtime.retry_degraded_startup(&ctx, &client).await;
+        assert_eq!(
+            runtime.middleware_registry_status,
+            MiddlewareRegistryStatus::Synchronized
+        );
+        assert!(runtime.stream.degraded_startup.is_none());
+        assert!(engine.current_generation() > initial_generation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_bootstrap_starts_degraded_when_middleware_is_unavailable() {
+        use openshell_core::proto::PolicySource;
+
+        let mut snapshot =
+            settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        enrich_proto_baseline_paths(snapshot.policy.as_mut().unwrap());
+        snapshot.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "unavailable-guard".to_string(),
+                grpc_endpoint: "http://127.0.0.1:1".to_string(),
+                ..Default::default()
+            }];
+
+        let (_, engine, _, status, origin, _, _, _) = load_stream_bootstrap_policy(
+            "sandbox-test",
+            "http://127.0.0.1:1",
+            snapshot,
+            &openshell_extension_core::ExtensionCredentialStore::new(),
+            None,
+        )
+        .await
+        .expect("an unreachable middleware service must not fail startup");
+
+        assert_eq!(status, MiddlewareRegistryStatus::NeedsReconciliation);
+        assert!(engine.is_some());
+        assert!(origin.allows_gateway_policy_reload());
     }
 }

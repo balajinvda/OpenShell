@@ -211,9 +211,7 @@ pub async fn start_boundary_access(
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
     mut prestarted_supervisor_session: Option<PrestartedSupervisorSession>,
-    config_apply_tx: Option<
-        tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
-    >,
+    config_apply_tx: tokio::sync::mpsc::Sender<crate::supervisor_session::ConfigApplyRequest>,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
     if let Some(prestarted) = prestarted_supervisor_session.as_ref() {

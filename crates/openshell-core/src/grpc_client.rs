@@ -1302,14 +1302,14 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 
 /// A reusable gRPC client for the `OpenShell` service.
 ///
-/// Wraps a tonic channel connected once and reused for status reporting and
-/// extension-credential rotation, avoiding per-request TLS handshake overhead.
+/// Wraps a tonic channel connected once and reused for policy polling
+/// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
-    /// the store, so the middleware registry and the stream loop that rotates
+    /// the store, so the middleware registry and the polling loop that rotates
     /// it observe the same slots.
     extension_credentials: ExtensionCredentialStore,
 }
@@ -1488,50 +1488,49 @@ pub struct ProviderEnvironmentResult {
     pub non_secret_environment_keys: Vec<String>,
 }
 
-impl From<crate::proto::ProviderEnvironmentSnapshot> for ProviderEnvironmentResult {
-    fn from(snapshot: crate::proto::ProviderEnvironmentSnapshot) -> Self {
+/// Delivered snapshots go through the polling projection, so both paths
+/// reject invalid expiration times and withhold on unknown readiness reasons.
+impl TryFrom<crate::proto::ProviderEnvironmentSnapshot> for ProviderEnvironmentResult {
+    type Error = miette::Report;
+
+    fn try_from(snapshot: crate::proto::ProviderEnvironmentSnapshot) -> Result<Self> {
         use crate::proto::ProviderEnvironmentValueClassification;
 
-        let readiness_reason = snapshot.readiness_reason();
-        let mut environment = HashMap::with_capacity(snapshot.values.len());
-        let mut credential_expires_at_ms = HashMap::new();
-        let mut static_credential_bindings = HashMap::new();
-        let mut non_secret_environment_keys = Vec::new();
+        let mut response = GetSandboxProviderEnvironmentResponse {
+            provider_env_revision: snapshot.provider_env_revision,
+            dynamic_credentials: snapshot.dynamic_credentials,
+            provider_attachment_epoch: snapshot.provider_attachment_epoch,
+            policy_hash: snapshot.policy_hash,
+            readiness_reason: snapshot.readiness_reason,
+            files: snapshot.files,
+            ..Default::default()
+        };
         for value in snapshot.values {
-            environment.insert(value.name.clone(), value.value);
-            if let Some(expires_at_ms) = value
-                .expiration_time
-                .as_ref()
-                .and_then(|timestamp| timestamp_to_millis(timestamp).ok())
-            {
-                credential_expires_at_ms.insert(value.name.clone(), expires_at_ms);
+            if let Some(expiration_time) = value.expiration_time {
+                response
+                    .credential_expiration_times
+                    .insert(value.name.clone(), expiration_time);
             }
             match ProviderEnvironmentValueClassification::try_from(value.classification)
                 .unwrap_or_default()
             {
                 ProviderEnvironmentValueClassification::NonSecret => {
-                    non_secret_environment_keys.push(value.name);
+                    response
+                        .non_secret_environment_keys
+                        .push(value.name.clone());
                 }
                 ProviderEnvironmentValueClassification::StaticCredential => {
                     if let Some(binding) = value.static_credential_binding {
-                        static_credential_bindings.insert(value.name, binding);
+                        response
+                            .static_credential_bindings
+                            .insert(value.name.clone(), binding);
                     }
                 }
                 ProviderEnvironmentValueClassification::Unspecified => {}
             }
+            response.environment.insert(value.name, value.value);
         }
-        Self {
-            environment,
-            provider_env_revision: snapshot.provider_env_revision,
-            provider_attachment_epoch: snapshot.provider_attachment_epoch,
-            policy_hash: snapshot.policy_hash,
-            readiness_reason,
-            credential_expires_at_ms,
-            dynamic_credentials: snapshot.dynamic_credentials,
-            static_credential_bindings,
-            non_secret_environment_keys,
-            files: snapshot.files,
-        }
+        provider_environment_result(response)
     }
 }
 
@@ -1540,12 +1539,12 @@ mod provider_snapshot_tests {
     use super::ProviderEnvironmentResult;
     use crate::proto::{
         ProviderEnvironmentSnapshot, ProviderEnvironmentValue,
-        ProviderEnvironmentValueClassification, StaticCredentialBinding,
+        ProviderEnvironmentValueClassification, ProviderReadinessReason, StaticCredentialBinding,
     };
 
     #[test]
     fn delivered_provider_snapshot_preserves_secret_classification_metadata() {
-        let result = ProviderEnvironmentResult::from(ProviderEnvironmentSnapshot {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
             provider_env_revision: 11,
             values: vec![
                 ProviderEnvironmentValue {
@@ -1559,15 +1558,57 @@ mod provider_snapshot_tests {
                     value: "redacted".to_string(),
                     classification: ProviderEnvironmentValueClassification::StaticCredential.into(),
                     static_credential_binding: Some(StaticCredentialBinding::default()),
-                    ..Default::default()
+                    expiration_time: Some(prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: 123_000_000,
+                    }),
                 },
             ],
             ..Default::default()
-        });
+        })
+        .expect("valid provider snapshot");
         assert_eq!(result.provider_env_revision, 11);
         assert_eq!(result.environment.len(), 2);
         assert_eq!(result.non_secret_environment_keys, ["REGION"]);
         assert!(result.static_credential_bindings.contains_key("TOKEN"));
+        assert_eq!(
+            result.credential_expires_at_ms.get("TOKEN"),
+            Some(&1_900_000_000_123)
+        );
+        assert_eq!(
+            result.readiness_reason,
+            ProviderReadinessReason::Unspecified
+        );
+    }
+
+    #[test]
+    fn delivered_provider_snapshot_withholds_unknown_readiness_reason() {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            readiness_reason: i32::MAX,
+            ..Default::default()
+        })
+        .expect("valid provider snapshot");
+        assert_eq!(
+            result.readiness_reason,
+            ProviderReadinessReason::CredentialsWithheld
+        );
+    }
+
+    #[test]
+    fn delivered_provider_snapshot_rejects_invalid_credential_expiration() {
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            values: vec![ProviderEnvironmentValue {
+                name: "TOKEN".to_string(),
+                value: "redacted".to_string(),
+                expiration_time: Some(prost_types::Timestamp {
+                    seconds: 1_900_000_000,
+                    nanos: -1,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(result.is_err());
     }
 }
 
@@ -1592,7 +1633,7 @@ impl CachedOpenShellClient {
         endpoint: &str,
         extension_credentials: ExtensionCredentialStore,
     ) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting reusable openshell gRPC client");
+        debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
@@ -1670,7 +1711,7 @@ impl CachedOpenShellClient {
     }
 
     /// Rotate every credential currently retained by the installed registry.
-    /// This remains available independently of streamed configuration updates.
+    /// This remains available when configuration polling fails independently.
     pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
         let names = self.extension_credentials.names();
         if names.is_empty() || !self.extension_credentials.needs_refresh(&names, now_ms()) {
