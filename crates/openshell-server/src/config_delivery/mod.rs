@@ -949,10 +949,13 @@ fn record_delivery(component: ConfigComponentKind, outcome: &'static str) {
     .increment(1);
 }
 
-/// Periodically rebuild current snapshots for this replica's sessions.
+/// Periodically rebuild the sandbox configuration of this replica's sessions.
 /// Streamed-apply sessions suppress unchanged snapshots, so this only repairs
-/// missed publications. Every replica runs its own pass, so it never notifies
-/// peers. Dormant in poll mode.
+/// missed publications. The provider environment is not rebuilt here: a
+/// sandbox configuration whose provider environment revision changed makes
+/// the supervisor wait for that component, and the gateway then builds it, as
+/// polling supervisors fetch it only when the revision changes. Every replica
+/// runs its own pass, so it never notifies peers. Dormant in poll mode.
 pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
@@ -965,7 +968,7 @@ pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
             state.config_delivery.with_queue(|queue| {
                 queue.publish_fanout(
                     &FanoutScope::AllConnected,
-                    ConfigComponents::ALL,
+                    ConfigComponents::SANDBOX_CONFIG,
                     false,
                     Instant::now(),
                 );
