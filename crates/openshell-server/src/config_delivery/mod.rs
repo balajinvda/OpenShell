@@ -4,6 +4,7 @@
 //! Build and deliver complete supervisor configuration snapshots.
 
 mod queue;
+pub mod session;
 mod session_slots;
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +16,7 @@ use futures::StreamExt;
 use metrics::counter;
 use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
-    ConfigBootstrap, ConfigComponent, PeerConfigProviderTarget, PeerConfigSandboxTarget,
+    ConfigComponent, PeerConfigProviderTarget, PeerConfigSandboxTarget,
     PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot,
     Sandbox, SandboxConfigSnapshot, peer_notify_config_update_request,
 };
@@ -45,10 +46,6 @@ const SANDBOX_CONFIG_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Provider environment builds also resolve credentials. Covers a cold Vault
 /// Kubernetes-auth login plus a read at the default 10-second request timeout.
 const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
-// Streamed-apply supervisors start from the bootstrap, so allow several
-// concurrent component builds, including revision-mismatch retries, before
-// rejecting the session. Session setup does not hold a delivery build slot.
-pub const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
 /// pool busy without stacking every waiter on the acquire timeout.
@@ -245,55 +242,6 @@ impl ConfigDelivery {
     fn lock(&self) -> MutexGuard<'_, DeliveryState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-pub async fn build_config_bootstrap(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-) -> Result<ConfigBootstrap, Status> {
-    tokio::time::timeout(
-        CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
-        build_consistent_config_bootstrap(state, sandbox),
-    )
-    .await
-    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
-}
-
-async fn build_consistent_config_bootstrap(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-) -> Result<ConfigBootstrap, Status> {
-    const MAX_BUILD_ATTEMPTS: usize = 3;
-    for _ in 0..MAX_BUILD_ATTEMPTS {
-        // Components are independent projections. The provider revision is a
-        // fence for the only overlapping input between sandbox configuration
-        // and provider environment state.
-        let (sandbox_config, provider_environment) = tokio::join!(
-            build_sandbox_config_snapshot(state, sandbox),
-            build_provider_environment_snapshot(state, sandbox, true),
-        );
-        let bootstrap = ConfigBootstrap {
-            sandbox_config: Some(sandbox_config?),
-            provider_environment: Some(provider_environment?),
-        };
-        if bootstrap_revisions_match(&bootstrap) {
-            return Ok(bootstrap);
-        }
-        counter!("openshell_supervisor_config_bootstrap_revision_mismatches_total").increment(1);
-    }
-    Err(Status::aborted(
-        "configuration changed while building supervisor bootstrap",
-    ))
-}
-
-fn bootstrap_revisions_match(bootstrap: &ConfigBootstrap) -> bool {
-    bootstrap
-        .sandbox_config
-        .as_ref()
-        .zip(bootstrap.provider_environment.as_ref())
-        .is_some_and(|(sandbox, provider)| {
-            sandbox.provider_env_revision == provider.provider_env_revision
-        })
 }
 
 pub fn push_enabled(state: &ServerState) -> bool {
@@ -1414,27 +1362,6 @@ mod tests {
                 .await
                 .is_none()
         );
-    }
-
-    #[test]
-    fn bootstrap_requires_matching_provider_revision_fence() {
-        let mut bootstrap = ConfigBootstrap {
-            sandbox_config: Some(SandboxConfigSnapshot {
-                provider_env_revision: 7,
-                ..Default::default()
-            }),
-            provider_environment: Some(ProviderEnvironmentSnapshot {
-                provider_env_revision: 8,
-                ..Default::default()
-            }),
-        };
-        assert!(!bootstrap_revisions_match(&bootstrap));
-        bootstrap
-            .provider_environment
-            .as_mut()
-            .unwrap()
-            .provider_env_revision = 7;
-        assert!(bootstrap_revisions_match(&bootstrap));
     }
 
     #[tokio::test]
