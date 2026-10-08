@@ -3,12 +3,13 @@
 
 //! Build and deliver complete supervisor configuration snapshots.
 
-mod queue;
 pub mod session;
 mod session_slots;
+mod task;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,7 @@ use openshell_core::proto::{
     PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot,
     Sandbox, SandboxConfigSnapshot, peer_notify_config_update_request,
 };
-use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use tokio::sync::Semaphore;
 use tonic::{Code, Request, Response, Status};
 use tracing::warn;
 
@@ -30,12 +30,9 @@ use crate::auth::principal::Principal;
 use crate::grpc::policy::{build_provider_environment_snapshot, build_sandbox_config_snapshot};
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
-pub use queue::Registration;
-use queue::{
-    BuildOutcome, BuildTicket, DeliveryKey, DeliveryQueue, FanoutScope, Lane, Limits,
-    PeerNotifyTarget, PeerNotifyTicket, Work,
-};
 pub use session_slots::{ConfigSlots, SessionOutbound};
+pub use task::Registration;
+use task::{Deliver, FanoutScope, Lane, Permits, SessionRecord, Work};
 
 /// Leaves headroom below tonic's default 4 MiB decode limit for framing and
 /// future envelope fields.
@@ -198,18 +195,26 @@ impl From<ConfigComponentKind> for ConfigComponent {
     }
 }
 
-/// Coalescing delivery queue shared by publications, supervisor sessions,
-/// and one on-demand delivery worker task.
+/// Per-session delivery tasks for this replica's push sessions, plus
+/// coalesced notifications to peer replicas.
 #[derive(Debug)]
 pub struct ConfigDelivery {
-    state: Mutex<DeliveryState>,
-    wake: Notify,
+    sessions: Mutex<HashMap<String, Arc<SessionRecord>>>,
+    permits: Permits,
+    /// Counts publications, so a registering session can tell whether one
+    /// raced its bootstrap.
+    publications: AtomicU64,
+    peer_notifies: Mutex<HashMap<PeerNotifyTarget, ConfigComponents>>,
+    peer_notify_permits: Arc<Semaphore>,
 }
 
-#[derive(Debug)]
-struct DeliveryState {
-    queue: DeliveryQueue,
-    delivery_worker_running: bool,
+/// Where a peer notification goes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PeerNotifyTarget {
+    /// Sandbox without a local push session; its owner may be a peer.
+    Sandbox(String),
+    /// Scope notification for every peer gateway.
+    Peers(FanoutScope),
 }
 
 impl ConfigDelivery {
@@ -221,26 +226,46 @@ impl ConfigDelivery {
             .saturating_mul(SNAPSHOT_BUILDS_PER_DB_CONNECTION)
             .max(MIN_CONCURRENT_SNAPSHOT_BUILDS);
         Self {
-            state: Mutex::new(DeliveryState {
-                queue: DeliveryQueue::new(Limits::new(builds, MAX_CONCURRENT_PEER_NOTIFIES)),
-                delivery_worker_running: false,
-            }),
-            wake: Notify::new(),
+            sessions: Mutex::new(HashMap::new()),
+            permits: Permits::new(builds),
+            publications: AtomicU64::new(0),
+            peer_notifies: Mutex::new(HashMap::new()),
+            peer_notify_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_NOTIFIES)),
         }
     }
 
-    pub(crate) fn current_seq(&self) -> u64 {
-        self.lock().queue.current_seq()
+    pub(crate) fn publications(&self) -> u64 {
+        self.publications.load(Ordering::SeqCst)
     }
 
-    fn with_queue<T>(&self, update: impl FnOnce(&mut DeliveryQueue) -> T) -> T {
-        update(&mut self.lock().queue)
+    #[cfg(test)]
+    fn has_session(&self, sandbox_id: &str) -> bool {
+        self.sessions().contains_key(sandbox_id)
     }
 
     /// Delivery is best effort beside the session lifecycle, so a poisoned
     /// lock must not turn session teardown into a panic.
-    fn lock(&self) -> MutexGuard<'_, DeliveryState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<SessionRecord>>> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns false when this gateway has no push session for the sandbox.
+    fn publish_sandbox(&self, sandbox_id: &str, components: ConfigComponents) -> bool {
+        self.publications.fetch_add(1, Ordering::SeqCst);
+        let Some(record) = self.sessions().get(sandbox_id).cloned() else {
+            return false;
+        };
+        record.mark(components, Lane::Sandbox);
+        true
+    }
+
+    fn publish_fanout(&self, scope: &FanoutScope, components: ConfigComponents) {
+        self.publications.fetch_add(1, Ordering::SeqCst);
+        for record in self.sessions().values() {
+            if record.in_scope(scope) {
+                record.mark(components, Lane::Fanout);
+            }
+        }
     }
 }
 
@@ -256,19 +281,19 @@ pub fn publish_sandbox_components(
     if !push_enabled(state) {
         return;
     }
-    let now = Instant::now();
     // A single-replica gateway owns every session, and registration covers a
     // session that is still connecting.
-    let may_be_remote = !state.store.is_single_replica();
-    state.config_delivery.with_queue(|queue| {
-        if !queue.publish_sandbox(sandbox_id, components, now) && may_be_remote {
-            queue.notify_peer(
-                PeerNotifyTarget::Sandbox(sandbox_id.to_string()),
-                components,
-            );
-        }
-    });
-    kick(state);
+    if !state
+        .config_delivery
+        .publish_sandbox(sandbox_id, components)
+        && !state.store.is_single_replica()
+    {
+        notify_peer(
+            state,
+            PeerNotifyTarget::Sandbox(sandbox_id.to_string()),
+            components,
+        );
+    }
 }
 
 pub fn publish_workspace_components(
@@ -308,241 +333,169 @@ fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope, components: Con
     if !push_enabled(state) {
         return;
     }
-    let notify_peers = !state.store.is_single_replica();
-    state.config_delivery.with_queue(|queue| {
-        queue.publish_fanout(scope, components, notify_peers, Instant::now());
-    });
-    kick(state);
+    state.config_delivery.publish_fanout(scope, components);
+    if !state.store.is_single_replica() {
+        notify_peer(state, PeerNotifyTarget::Peers(scope.clone()), components);
+    }
 }
 
-/// Make a streamed-apply session visible to fanouts and sandbox updates.
+/// Make a streamed-apply session visible to publications and start its
+/// delivery task.
 pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
-    state.config_delivery.with_queue(|queue| {
+    let delivery = &state.config_delivery;
+    let raced = delivery.publications() > registration.captured_seq;
+    let record = Arc::new(SessionRecord::new(registration));
+    {
+        let mut sessions = delivery.sessions();
         // A concurrent reconnect may already own the registry entry. Checking
-        // under the queue lock keeps the newest session registered.
-        if state
+        // under the sessions lock keeps the newest session registered.
+        if !state
             .supervisor_sessions
-            .is_current_session(&registration.sandbox_id, &registration.session_id)
+            .is_current_session(&record.sandbox_id, &record.session_id)
         {
-            queue.register(registration, Instant::now());
+            return;
         }
+        if let Some(previous) = sessions.insert(record.sandbox_id.clone(), Arc::clone(&record)) {
+            previous.close();
+        }
+    }
+    // A publication between the bootstrap read and registration may have
+    // missed this session.
+    if raced {
+        record.mark(ConfigComponents::ALL, Lane::Sandbox);
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        task::run(
+            record,
+            &state.config_delivery.permits,
+            &Builder(&state),
+            task::RECONCILE_INTERVAL,
+        )
+        .await;
     });
-    kick(state);
 }
 
 pub fn unregister_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
-    state
-        .config_delivery
-        .with_queue(|queue| queue.unregister(sandbox_id, session_id));
-}
-
-fn kick(state: &Arc<ServerState>) {
-    let start = {
-        let mut delivery = state.config_delivery.lock();
-        !std::mem::replace(&mut delivery.delivery_worker_running, true)
-    };
-    if start {
-        tokio::spawn(run_delivery_worker(Arc::clone(state)));
-    } else {
-        state.config_delivery.wake.notify_one();
+    let mut sessions = state.config_delivery.sessions();
+    if sessions
+        .get(sandbox_id)
+        .is_some_and(|record| record.session_id == session_id)
+        && let Some(record) = sessions.remove(sandbox_id)
+    {
+        record.close();
     }
 }
 
-/// Releases outstanding work if the delivery worker unwinds, so a later
-/// publication starts a replacement with consistent slot accounting.
-struct DeliveryWorkerGuard {
-    state: Arc<ServerState>,
-    tickets: HashMap<tokio::task::Id, Work>,
-    finished: bool,
-}
+/// Builds and delivers a session's components.
+struct Builder<'a>(&'a Arc<ServerState>);
 
-impl Drop for DeliveryWorkerGuard {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let mut delivery = self.state.config_delivery.lock();
-        let now = Instant::now();
-        for work in self.tickets.values() {
-            match work {
-                Work::Build(ticket) => {
-                    delivery
-                        .queue
-                        .complete_build(ticket, BuildOutcome::Failed, now);
-                }
-                Work::PeerNotify(ticket) => delivery.queue.complete_peer_notify(ticket),
-            }
-        }
-        delivery.delivery_worker_running = false;
-    }
-}
-
-async fn run_delivery_worker(state: Arc<ServerState>) {
-    let delivery = &state.config_delivery;
-    let mut tasks = JoinSet::new();
-    let mut guard = DeliveryWorkerGuard {
-        state: Arc::clone(&state),
-        tickets: HashMap::new(),
-        finished: false,
-    };
-    loop {
-        let started = {
-            let mut delivery_state = delivery.lock();
-            let now = Instant::now();
-            let mut started = Vec::new();
-            while let Some(work) = delivery_state.queue.next_work(now) {
-                started.push(work);
-            }
-            delivery_state.queue.record_gauges();
-            // Clearing the flag under the queue lock means a concurrent
-            // publication either sees this delivery worker running or starts one.
-            if started.is_empty() && !delivery_state.queue.has_running_work() {
-                delivery_state.delivery_worker_running = false;
-                guard.finished = true;
-                return;
-            }
-            started
-        };
-        for work in started {
-            let handle = tasks.spawn(run_work(Arc::clone(&state), work.clone()));
-            guard.tickets.insert(handle.id(), work);
-        }
-        tokio::select! {
-            joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
-                let (id, result) = match joined.expect("join set is not empty") {
-                    Ok((id, result)) => (id, Some(result)),
-                    Err(error) => {
-                        // Panic payloads may contain credential backend data.
-                        warn!(
-                            cancelled = error.is_cancelled(),
-                            panicked = error.is_panic(),
-                            "supervisor configuration delivery task failed"
+impl Deliver for Builder<'_> {
+    async fn deliver(
+        &self,
+        record: &SessionRecord,
+        work: Work,
+    ) -> (ConfigComponents, Option<HashSet<String>>) {
+        let state = self.0;
+        let mut failed = ConfigComponents::default();
+        let mut providers = None;
+        for component in work.components.selected() {
+            match run_build(state, record, component, work.lane).await {
+                BuildResult::Built {
+                    providers: built,
+                    owner_moved,
+                } => {
+                    providers = built.or(providers);
+                    if owner_moved {
+                        notify_peer(
+                            state,
+                            PeerNotifyTarget::Sandbox(record.sandbox_id.clone()),
+                            ConfigComponents::only(component),
                         );
-                        (error.id(), None)
                     }
-                };
-                let work = guard.tickets.remove(&id).expect("delivery task has a ticket");
-                complete_work(&state, &work, result);
+                }
+                BuildResult::Failed => failed = failed.union(ConfigComponents::only(component)),
             }
-            () = delivery.wake.notified() => {}
         }
+        (failed, providers)
     }
 }
 
-enum WorkResult {
-    Build(BuildResult),
-    PeerNotify(PeerNotifyResult),
+enum BuildResult {
+    /// `providers` is the attachment list read with the snapshot, when the
+    /// sandbox still exists.
+    Built {
+        providers: Option<HashSet<String>>,
+        /// The session moved to another gateway after the build started.
+        owner_moved: bool,
+    },
+    Failed,
 }
 
-struct BuildResult {
-    outcome: BuildOutcome,
-    /// The session moved to another gateway after the build started.
-    owner_moved: bool,
-}
-
-enum PeerNotifyResult {
-    Done,
-    /// This gateway owns the current session for the notified sandbox.
-    Local,
-}
-
-async fn run_work(state: Arc<ServerState>, work: Work) -> WorkResult {
-    match work {
-        Work::Build(ticket) => WorkResult::Build(run_build(&state, &ticket).await),
-        Work::PeerNotify(ticket) => WorkResult::PeerNotify(run_peer_notify(&state, &ticket).await),
-    }
-}
-
-fn complete_work(state: &ServerState, work: &Work, result: Option<WorkResult>) {
-    let now = Instant::now();
-    state
-        .config_delivery
-        .with_queue(|queue| match (work, result) {
-            (Work::Build(ticket), Some(WorkResult::Build(result))) => {
-                queue.complete_build(ticket, result.outcome, now);
-                if result.owner_moved {
-                    queue.notify_peer(
-                        PeerNotifyTarget::Sandbox(ticket.key.sandbox_id.clone()),
-                        ConfigComponents::only(ticket.key.component),
-                    );
-                }
-            }
-            (Work::Build(ticket), _) => {
-                queue.complete_build(ticket, BuildOutcome::Failed, now);
-            }
-            (Work::PeerNotify(ticket), result) => {
-                queue.complete_peer_notify(ticket);
-                if let (
-                    PeerNotifyTarget::Sandbox(sandbox_id),
-                    Some(WorkResult::PeerNotify(PeerNotifyResult::Local)),
-                ) = (&ticket.target, result)
-                {
-                    queue.publish_sandbox(sandbox_id, ticket.components, now);
-                }
-            }
-        });
-}
-
-async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResult {
-    let BuildTicket {
-        key,
-        lane,
-        session_id,
-        ..
-    } = ticket;
-    let failed = BuildResult {
-        outcome: BuildOutcome::Failed,
-        owner_moved: false,
-    };
+async fn run_build(
+    state: &Arc<ServerState>,
+    record: &SessionRecord,
+    component: ConfigComponentKind,
+    lane: Lane,
+) -> BuildResult {
+    let sandbox_id = record.sandbox_id.as_str();
+    let session_id = record.session_id.as_str();
     let started = Instant::now();
-    let built =
-        tokio::time::timeout(build_timeout(key.component), build_component(state, key)).await;
+    let built = tokio::time::timeout(
+        build_timeout(component),
+        build_component(state, sandbox_id, component),
+    )
+    .await;
     let elapsed = started.elapsed();
     let (message, providers) = match built {
         Ok(Ok(Some(built))) => built,
         Ok(Ok(None)) => {
-            record_build(key.component, *lane, "ok", elapsed);
-            return BuildResult {
-                outcome: BuildOutcome::Built { providers: None },
+            record_build(component, lane, "ok", elapsed);
+            return BuildResult::Built {
+                providers: None,
                 owner_moved: false,
             };
         }
         Ok(Err(error)) => {
-            record_build_failure(key, *lane, "failed", error.code(), elapsed);
-            return failed;
+            record_build_failure(sandbox_id, component, lane, "failed", error.code(), elapsed);
+            return BuildResult::Failed;
         }
         Err(_) => {
-            record_build_failure(key, *lane, "timeout", Code::DeadlineExceeded, elapsed);
-            return failed;
+            record_build_failure(
+                sandbox_id,
+                component,
+                lane,
+                "timeout",
+                Code::DeadlineExceeded,
+                elapsed,
+            );
+            return BuildResult::Failed;
         }
     };
-    record_build(key.component, *lane, "ok", elapsed);
-    let owner_moved = match owner_check(state, &key.sandbox_id, session_id).await {
+    record_build(component, lane, "ok", elapsed);
+    let owner_moved = match owner_check(state, sandbox_id, session_id).await {
         OwnerCheck::Current => {
-            let disposition =
-                state
-                    .supervisor_sessions
-                    .deliver_config(&key.sandbox_id, session_id, message);
-            record_delivery(key.component, disposition.metric_label());
+            let disposition = state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, session_id, message);
+            record_delivery(component, disposition.metric_label());
             false
         }
         OwnerCheck::Remote => {
-            record_delivery(key.component, "owner_moved");
+            record_delivery(component, "owner_moved");
             true
         }
         OwnerCheck::Gone => {
-            record_delivery(key.component, "no_active_session");
+            record_delivery(component, "no_active_session");
             false
         }
         OwnerCheck::Unknown => {
-            record_delivery(key.component, "owner_lookup_failed");
-            return failed;
+            record_delivery(component, "owner_lookup_failed");
+            return BuildResult::Failed;
         }
     };
-    BuildResult {
-        outcome: BuildOutcome::Built {
-            providers: Some(providers),
-        },
+    BuildResult::Built {
+        providers: Some(providers),
         owner_moved,
     }
 }
@@ -558,15 +511,16 @@ const fn build_timeout(component: ConfigComponentKind) -> Duration {
     name = "config_build",
     level = "debug",
     skip_all,
-    fields(otel.name = "config_delivery.build", sandbox_id = %key.sandbox_id, component = key.component.name())
+    fields(otel.name = "config_delivery.build", sandbox_id, component = component.name())
 )]
 async fn build_component(
     state: &Arc<ServerState>,
-    key: &DeliveryKey,
+    sandbox_id: &str,
+    component: ConfigComponentKind,
 ) -> Result<Option<(SupervisorConfigMessage, HashSet<String>)>, Status> {
     let Some(sandbox) = state
         .store
-        .get_message::<Sandbox>(&key.sandbox_id)
+        .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
     else {
@@ -577,7 +531,7 @@ async fn build_component(
         .as_ref()
         .map(|spec| spec.providers.iter().cloned().collect())
         .unwrap_or_default();
-    let message = match key.component {
+    let message = match component {
         ConfigComponentKind::SandboxConfig => SupervisorConfigMessage::SandboxConfig(Box::new(
             build_sandbox_config_snapshot(state, &sandbox).await?,
         )),
@@ -621,16 +575,71 @@ async fn owner_check(state: &Arc<ServerState>, sandbox_id: &str, session_id: &st
     }
 }
 
-async fn run_peer_notify(state: &Arc<ServerState>, ticket: &PeerNotifyTicket) -> PeerNotifyResult {
-    match &ticket.target {
-        PeerNotifyTarget::Sandbox(sandbox_id) => {
-            notify_sandbox_owner(state, sandbox_id, ticket.components).await
-        }
-        PeerNotifyTarget::Peers(scope) => {
-            notify_peers(state, scope, ticket.components).await;
-            PeerNotifyResult::Done
+/// Queue a notification for `target`. Notifications for the same target
+/// coalesce while one is pending or running.
+fn notify_peer(state: &Arc<ServerState>, target: PeerNotifyTarget, components: ConfigComponents) {
+    let start = {
+        let mut pending = state
+            .config_delivery
+            .peer_notifies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut start = false;
+        pending
+            .entry(target.clone())
+            .and_modify(|queued| *queued = queued.union(components))
+            .or_insert_with(|| {
+                start = true;
+                components
+            });
+        start
+    };
+    if start {
+        tokio::spawn(run_peer_notifies(Arc::clone(state), target));
+    }
+}
+
+async fn run_peer_notifies(state: Arc<ServerState>, target: PeerNotifyTarget) {
+    let _permit = Arc::clone(&state.config_delivery.peer_notify_permits)
+        .acquire_owned()
+        .await
+        .expect("peer notification semaphore is never closed");
+    loop {
+        let components = {
+            let mut pending = state
+                .config_delivery
+                .peer_notifies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(queued) = pending.get_mut(&target) else {
+                return;
+            };
+            if queued.is_empty() {
+                pending.remove(&target);
+                return;
+            }
+            std::mem::take(queued)
+        };
+        match &target {
+            PeerNotifyTarget::Sandbox(sandbox_id) => {
+                if notify_sandbox_owner(&state, sandbox_id, components).await
+                    == PeerNotifyResult::Local
+                {
+                    state
+                        .config_delivery
+                        .publish_sandbox(sandbox_id, components);
+                }
+            }
+            PeerNotifyTarget::Peers(scope) => notify_peers(&state, scope, components).await,
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PeerNotifyResult {
+    Done,
+    /// This gateway owns the current session for the notified sandbox.
+    Local,
 }
 
 /// Send a secret-free notification to the gateway that owns the sandbox session. The
@@ -815,10 +824,9 @@ pub fn handle_peer_notify_config_update(
                 .supervisor_sessions
                 .is_current_session(&target.sandbox_id, &target.session_id)
             {
-                state.config_delivery.with_queue(|queue| {
-                    queue.publish_sandbox(&target.sandbox_id, components, Instant::now())
-                });
-                kick(state);
+                state
+                    .config_delivery
+                    .publish_sandbox(&target.sandbox_id, components);
             } else {
                 response.stale_owner = true;
             }
@@ -850,10 +858,7 @@ pub fn handle_peer_notify_config_update(
             ));
         }
     };
-    state.config_delivery.with_queue(|queue| {
-        queue.publish_fanout(&scope, components, false, Instant::now());
-    });
-    kick(state);
+    state.config_delivery.publish_fanout(&scope, components);
     Ok(Response::new(response))
 }
 
@@ -894,7 +899,7 @@ pub fn register_test_apply_session(
                 .as_ref()
                 .map(|spec| spec.providers.iter().cloned().collect())
                 .unwrap_or_default(),
-            captured_seq: state.config_delivery.current_seq(),
+            captured_seq: state.config_delivery.publications(),
         },
     );
     TestApplySession {
@@ -925,16 +930,17 @@ fn record_build(
 }
 
 fn record_build_failure(
-    key: &DeliveryKey,
+    sandbox_id: &str,
+    component: ConfigComponentKind,
     lane: Lane,
     outcome: &'static str,
     error_code: Code,
     elapsed: Duration,
 ) {
-    record_build(key.component, lane, outcome, elapsed);
+    record_build(component, lane, outcome, elapsed);
     warn!(
-        sandbox_id = %key.sandbox_id,
-        component = key.component.name(),
+        sandbox_id,
+        component = component.name(),
         ?error_code,
         "failed to build supervisor configuration snapshot"
     );
@@ -947,35 +953,6 @@ fn record_delivery(component: ConfigComponentKind, outcome: &'static str) {
         "outcome" => outcome,
     )
     .increment(1);
-}
-
-/// Periodically rebuild the sandbox configuration of this replica's sessions.
-/// Streamed-apply sessions suppress unchanged snapshots, so this only repairs
-/// missed publications. The provider environment is not rebuilt here: a
-/// sandbox configuration whose provider environment revision changed makes
-/// the supervisor wait for that component, and the gateway then builds it, as
-/// polling supervisors fetch it only when the revision changes. Every replica
-/// runs its own pass, so it never notifies peers. Dormant in poll mode.
-pub fn spawn_owner_reconciler(state: Arc<ServerState>, interval: Duration) {
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval(interval);
-        timer.tick().await;
-        loop {
-            timer.tick().await;
-            if !push_enabled(&state) {
-                continue;
-            }
-            state.config_delivery.with_queue(|queue| {
-                queue.publish_fanout(
-                    &FanoutScope::AllConnected,
-                    ConfigComponents::SANDBOX_CONFIG,
-                    false,
-                    Instant::now(),
-                );
-            });
-            kick(&state);
-        }
-    });
 }
 
 fn record_peer_notify(outcome: &'static str) {
@@ -1186,9 +1163,7 @@ mod tests {
     }
 
     fn has_recipient(state: &ServerState, sandbox_id: &str) -> bool {
-        state
-            .config_delivery
-            .with_queue(|queue| queue.has_recipient(sandbox_id))
+        state.config_delivery.has_session(sandbox_id)
     }
 
     #[tokio::test]
@@ -1204,8 +1179,7 @@ mod tests {
         publish_provider_components(&state, "default", "github", ConfigComponents::ALL);
         publish_all_connected(&state, ConfigComponents::ALL);
 
-        assert_eq!(state.config_delivery.current_seq(), 0);
-        assert!(!state.config_delivery.lock().delivery_worker_running);
+        assert_eq!(state.config_delivery.publications(), 0);
         assert!(
             next_update(&mut harness, Duration::from_millis(100))
                 .await
@@ -1231,40 +1205,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_for_a_moved_session_notifies_the_new_owner() {
+    async fn peer_notifications_for_one_target_coalesce() {
         let state = push_state().await;
-        let work = state.config_delivery.with_queue(|queue| {
-            queue.register(
-                Registration {
-                    sandbox_id: "moved".into(),
+        let target = PeerNotifyTarget::Sandbox("remote".into());
+        notify_peer(&state, target.clone(), ConfigComponents::SANDBOX_CONFIG);
+        notify_peer(
+            &state,
+            target.clone(),
+            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment),
+        );
+        {
+            let pending = state.config_delivery.peer_notifies.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[&target], ConfigComponents::ALL);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state
+                .config_delivery
+                .peer_notifies
+                .lock()
+                .unwrap()
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the notification task drains its target");
+    }
+
+    #[test]
+    fn fanout_marks_ten_thousand_sessions_once_each() {
+        let delivery = ConfigDelivery::for_db_connections(5);
+        let records: Vec<_> = (0..10_000)
+            .map(|index| {
+                Arc::new(SessionRecord::new(Registration {
+                    sandbox_id: format!("sb-{index:05}"),
                     session_id: "session".into(),
-                    workspace: "default".into(),
+                    workspace: "ws".into(),
                     providers: HashSet::new(),
                     captured_seq: 0,
-                },
-                Instant::now(),
-            );
-            queue.publish_sandbox("moved", ConfigComponents::SANDBOX_CONFIG, Instant::now());
-            queue.next_work(Instant::now()).unwrap()
-        });
-
-        complete_work(
-            &state,
-            &work,
-            Some(WorkResult::Build(BuildResult {
-                outcome: BuildOutcome::Built { providers: None },
-                owner_moved: true,
-            })),
+                }))
+            })
+            .collect();
+        delivery.sessions().extend(
+            records
+                .iter()
+                .map(|record| (record.sandbox_id.clone(), Arc::clone(record))),
         );
-        let next = state
-            .config_delivery
-            .with_queue(|queue| queue.next_work(Instant::now()));
-        assert_eq!(
-            next,
-            Some(Work::PeerNotify(PeerNotifyTicket {
-                target: PeerNotifyTarget::Sandbox("moved".into()),
-                components: ConfigComponents::SANDBOX_CONFIG,
-            }))
+        for _ in 0..3 {
+            delivery.publish_fanout(&FanoutScope::AllConnected, ConfigComponents::SANDBOX_CONFIG);
+        }
+        assert_eq!(delivery.publications(), 3);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.in_scope(&FanoutScope::AllConnected))
         );
     }
 
@@ -1272,7 +1268,8 @@ mod tests {
     fn build_slots_are_sized_from_the_database_pool() {
         let builds = |connections| {
             ConfigDelivery::for_db_connections(connections)
-                .with_queue(|queue| queue.limits().builds())
+                .permits
+                .builds()
         };
         assert_eq!(builds(10), 20);
         assert_eq!(builds(1), MIN_CONCURRENT_SNAPSHOT_BUILDS);

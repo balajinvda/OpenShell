@@ -307,7 +307,7 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
-    /// Coalescing queue and delivery worker for supervisor configuration delivery.
+    /// Per-session delivery tasks for supervisor configuration.
     pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Stable identity for this gateway process.
@@ -987,7 +987,6 @@ pub(crate) async fn run_server(
     );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
-    config_delivery::spawn_owner_reconciler(state.clone(), Duration::from_secs(30));
     provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 

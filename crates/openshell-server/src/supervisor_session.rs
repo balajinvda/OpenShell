@@ -2496,7 +2496,7 @@ pub async fn handle_connect_supervisor(
     };
     // Captured before reading any bootstrap input, including the sandbox
     // record, so registration detects publications the bootstrap may miss.
-    let captured_seq = stream_applies_config.then(|| state.config_delivery.current_seq());
+    let captured_seq = stream_applies_config.then(|| state.config_delivery.publications());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
     // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
