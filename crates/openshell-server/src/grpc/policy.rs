@@ -7644,6 +7644,12 @@ async fn apply_merge_operations_with_retry(
                     tokio::task::yield_now().await;
                     continue;
                 }
+                if matches!(e, crate::persistence::PersistenceError::SandboxDeleting) {
+                    return Err(super::persistence_error_to_status(
+                        e,
+                        "persist policy revision",
+                    ));
+                }
                 return Err(Status::internal(format!(
                     "persist policy revision failed: {e}"
                 )));

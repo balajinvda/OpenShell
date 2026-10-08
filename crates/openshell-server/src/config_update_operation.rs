@@ -756,7 +756,7 @@ pub async fn wait_for_terminal(
     let record = get_record(state, operation_id)
         .await?
         .ok_or_else(|| Status::not_found("update operation not found"))?;
-    let operation = public_operation(&record)?;
+    let mut operation = public_operation(&record)?;
     let operation_state = ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
     if terminal(operation_state) {
         histogram!("openshell_config_update_operation_wait_seconds")
@@ -771,10 +771,14 @@ pub async fn wait_for_terminal(
         .config_update_operation_watch_bus
         .subscribe(operation_id);
     loop {
-        let record = get_record(state, operation_id)
-            .await?
-            .ok_or_else(|| Status::not_found("update operation not found"))?;
-        let operation = public_operation(&record)?;
+        // Sandbox deletion removes its operations, so a pending operation that
+        // disappears was cancelled with its sandbox.
+        let Some(record) = get_record(state, operation_id).await? else {
+            histogram!("openshell_config_update_operation_wait_seconds")
+                .record(started.elapsed().as_secs_f64());
+            return Ok(cancelled_with_sandbox(operation));
+        };
+        operation = public_operation(&record)?;
         let operation_state =
             ConfigUpdateOperationState::try_from(operation.state).unwrap_or_default();
         if terminal(operation_state) {
@@ -796,6 +800,16 @@ pub async fn wait_for_terminal(
             _ = wake.recv() => {}
         }
     }
+}
+
+fn cancelled_with_sandbox(mut operation: ConfigUpdateOperation) -> ConfigUpdateOperation {
+    let now = Some(timestamp(current_time_ms()));
+    operation.state = ConfigUpdateOperationState::Cancelled.into();
+    operation.outcome = ConfigApplyOutcome::Unspecified.into();
+    operation.sanitized_error = sanitize_error("sandbox no longer exists");
+    operation.updated_time.clone_from(&now);
+    operation.completed_time = now;
+    operation
 }
 
 async fn reconcile_sandbox(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
@@ -1163,6 +1177,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.config_update_operation_watch_bus.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_reports_cancellation_when_sandbox_deletion_removes_the_operation() {
+        let (state, record) = pending_test_operation().await;
+        let operation = record.operation.as_ref().unwrap();
+        let operation_id = operation.operation_id.clone();
+        let sandbox_id = operation.sandbox_id.clone();
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            let operation_id = operation_id.clone();
+            async move { wait_for_terminal(&state, &operation_id, Duration::from_secs(5)).await }
+        });
+        // The waiter subscribes after its first read observed the operation.
+        while state.config_update_operation_watch_bus.len() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        state
+            .store
+            .delete_by_scope(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, &sandbox_id)
+            .await
+            .unwrap();
+
+        let operation = waiter.await.unwrap().unwrap();
+        assert_eq!(operation.operation_id, operation_id);
+        assert_eq!(
+            operation.state,
+            i32::from(ConfigUpdateOperationState::Cancelled)
+        );
+        assert_eq!(operation.sanitized_error, "sandbox no longer exists");
+        assert!(operation.completed_time.is_some());
     }
 
     #[tokio::test]
