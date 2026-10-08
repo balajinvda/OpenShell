@@ -949,9 +949,12 @@ async fn record_component_apply_result(
     {
         return Ok(());
     }
+    // Degraded enforces the policy with only built-in middleware.
     let loaded = matches!(
         outcome,
-        ConfigApplyOutcome::Applied | ConfigApplyOutcome::IgnoredDuplicate
+        ConfigApplyOutcome::Applied
+            | ConfigApplyOutcome::IgnoredDuplicate
+            | ConfigApplyOutcome::Degraded
     );
     let failed = matches!(
         outcome,
