@@ -2268,6 +2268,11 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
             "supervisor session: superseded previous session"
         );
     }
+    if expected_bootstrap.is_some() {
+        state
+            .supervisor_sessions
+            .await_config_bootstrap(&sandbox_id, &session_id);
+    }
 
     // A replacement stream is a new observation authority. Reset its endpoint
     // results before acknowledging the session so it cannot inherit evidence

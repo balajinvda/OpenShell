@@ -163,6 +163,10 @@ struct ComponentDeliveryState {
     /// The supervisor staged the last delivered update until its matching
     /// counterpart arrives, and still owes a result for it.
     staged: bool,
+    /// When the session's bootstrap was sent, until its result arrives. A
+    /// rebuild that races the bootstrap waits as `pending`, so it is dropped
+    /// if the bootstrap result acknowledges the same snapshot.
+    awaiting_bootstrap_since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -248,18 +252,20 @@ impl ConfigSessionState {
         {
             return Err(DeliveryDisposition::SuppressedUnchanged);
         }
-        // Hold the component until the supervisor acknowledges the update it
-        // already has, bounded so a lost result cannot stall it.
-        if delivery_state
+        // Hold the component until the supervisor acknowledges the update or
+        // bootstrap it already has, bounded so a lost result cannot stall it.
+        let held_since = delivery_state
             .in_flight
             .as_ref()
-            .is_some_and(|update| update.sent_at.elapsed() < CONFIG_ACK_TIMEOUT)
-        {
+            .map(|update| update.sent_at)
+            .or(delivery_state.awaiting_bootstrap_since);
+        if held_since.is_some_and(|sent_at| sent_at.elapsed() < CONFIG_ACK_TIMEOUT) {
             delivery_state.pending = Some(message);
             return Err(DeliveryDisposition::Coalesced);
         }
         delivery_state.pending = None;
         delivery_state.in_flight = None;
+        delivery_state.awaiting_bootstrap_since = None;
 
         // Replacing an unsent snapshot leaves a gap in the sequence.
         let (message, in_flight) = build_config_update(delivery_state, message);
@@ -342,30 +348,53 @@ impl ConfigSessionState {
             None
         };
         let finalized = Finalized::Done { rebuild };
+        (finalized, self.release_pending(component, pending))
+    }
 
+    /// Send a held snapshot, unless the supervisor already acknowledged it.
+    fn release_pending(
+        &mut self,
+        component: ConfigComponentKind,
+        pending: Option<SupervisorConfigMessage>,
+    ) -> Option<Outgoing> {
+        let pending = pending?;
         let slots = Arc::clone(&self.slots);
         let delivery_state = self.component_mut(component);
-        let Some(pending) = pending else {
-            return (finalized, None);
-        };
         if delivery_state.last_acknowledged_fingerprint.as_ref()
             == Some(&ComponentSnapshot::from(&pending).fingerprint())
         {
-            return (finalized, None);
+            return None;
         }
         let (message, next) = build_config_update(delivery_state, pending);
         if message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
-            return (finalized, None);
+            return None;
         }
         delivery_state.in_flight = Some(next);
-        (
-            finalized,
-            Some(Outgoing {
-                slots,
-                component,
-                message,
-            }),
-        )
+        Some(Outgoing {
+            slots,
+            component,
+            message,
+        })
+    }
+
+    /// Hold rebuilds until the bootstrap result arrives.
+    fn await_bootstrap(&mut self) {
+        let now = Instant::now();
+        self.sandbox_config.awaiting_bootstrap_since = Some(now);
+        self.provider_environment.awaiting_bootstrap_since = Some(now);
+    }
+
+    /// The bootstrap result for `component` arrived: release a snapshot held
+    /// behind it.
+    fn end_bootstrap_hold(&mut self, component: ConfigComponentKind) -> Option<Outgoing> {
+        let delivery_state = self.component_mut(component);
+        delivery_state.awaiting_bootstrap_since = None;
+        if delivery_state.in_flight.is_some() {
+            // A snapshot sent after the hold expired owns the pending slot.
+            return None;
+        }
+        let pending = delivery_state.pending.take();
+        self.release_pending(component, pending)
     }
 
     fn acknowledge_bootstrap(
@@ -480,12 +509,38 @@ impl SupervisorSessionRegistry {
         sandbox_id: &str,
         session_id: &str,
         result: &ConfigComponentApplyResult,
-        fingerprint: &ConfigSnapshotFingerprint,
+        fingerprint: Option<&ConfigSnapshotFingerprint>,
     ) -> bool {
+        let Some(component) = ConfigComponentKind::from_proto(result.component) else {
+            return false;
+        };
+        let Some((acknowledged, outgoing)) = self
+            .with_config_session(sandbox_id, session_id, |config| {
+                config.map(|config| {
+                    let acknowledged = fingerprint.is_some_and(|fingerprint| {
+                        config.acknowledge_bootstrap(result, fingerprint)
+                    });
+                    (acknowledged, config.end_bootstrap_hold(component))
+                })
+            })
+            .flatten()
+        else {
+            return false;
+        };
+        if let Some(outgoing) = outgoing {
+            outgoing.send();
+        }
+        acknowledged
+    }
+
+    /// Hold configuration updates for a session until its bootstrap result
+    /// arrives.
+    pub(crate) fn await_config_bootstrap(&self, sandbox_id: &str, session_id: &str) {
         self.with_config_session(sandbox_id, session_id, |config| {
-            config.is_some_and(|config| config.acknowledge_bootstrap(result, fingerprint))
-        })
-        .unwrap_or(false)
+            if let Some(config) = config {
+                config.await_bootstrap();
+            }
+        });
     }
 }
 
@@ -776,17 +831,8 @@ pub async fn handle_bootstrap_result(
         return false;
     }
     for component in &result.results {
-        match record_component_apply_result(state, sandbox_id, component).await {
-            Ok(()) => {
-                if let Some(expected) = expected.expected(component.component) {
-                    state.supervisor_sessions.acknowledge_bootstrap_component(
-                        sandbox_id,
-                        session_id,
-                        component,
-                        &expected.fingerprint,
-                    );
-                }
-            }
+        let recorded = match record_component_apply_result(state, sandbox_id, component).await {
+            Ok(()) => true,
             Err(error) => {
                 warn!(
                     sandbox_id,
@@ -795,8 +841,19 @@ pub async fn handle_bootstrap_result(
                     error = %error,
                     "failed to persist supervisor bootstrap result"
                 );
+                false
             }
-        }
+        };
+        let fingerprint = expected
+            .expected(component.component)
+            .filter(|_| recorded)
+            .map(|expected| &expected.fingerprint);
+        state.supervisor_sessions.acknowledge_bootstrap_component(
+            sandbox_id,
+            session_id,
+            component,
+            fingerprint,
+        );
     }
     persist_and_ack_admission(session, &admission).await
 }
@@ -1257,6 +1314,40 @@ impl StartupCandidate {
     }
 }
 
+/// The result a supervisor reports after applying `bootstrap` in full.
+#[cfg(test)]
+pub fn applied_bootstrap_result(bootstrap: &ConfigBootstrap) -> ConfigBootstrapResult {
+    let sandbox = bootstrap
+        .sandbox_config
+        .as_ref()
+        .expect("sandbox bootstrap component");
+    let provider = bootstrap
+        .provider_environment
+        .as_ref()
+        .expect("provider bootstrap component");
+    let applied =
+        |component: ConfigComponent, revision: ConfigSnapshotRevision| ConfigComponentApplyResult {
+            component: component.into(),
+            requested_revision: Some(revision.clone()),
+            applied_revision: Some(revision),
+            outcome: ConfigApplyOutcome::Applied.into(),
+            ..Default::default()
+        };
+    ConfigBootstrapResult {
+        results: vec![
+            applied(
+                ConfigComponent::SandboxConfig,
+                ComponentSnapshot::SandboxConfig(sandbox).revision(),
+            ),
+            applied(
+                ConfigComponent::ProviderEnvironment,
+                ComponentSnapshot::ProviderEnvironment(provider).revision(),
+            ),
+        ],
+        admission: Some(expected_configuration_admission(sandbox)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1683,6 +1774,70 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_racing_the_bootstrap_waits_and_is_dropped_when_unchanged() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        registry.await_config_bootstrap("sb-1", "session-1");
+        let snapshot = |revision| {
+            SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+                provider_env_revision: revision,
+                ..Default::default()
+            })
+        };
+        let bootstrap_result = |revision| {
+            let revision = ConfigSnapshotRevision {
+                component: Some(config_snapshot_revision::Component::ProviderEnvironment(
+                    revision,
+                )),
+            };
+            ConfigComponentApplyResult {
+                component: ConfigComponent::ProviderEnvironment.into(),
+                requested_revision: Some(revision.clone()),
+                applied_revision: Some(revision),
+                outcome: ConfigApplyOutcome::Applied.into(),
+                ..Default::default()
+            }
+        };
+        let fingerprint = |revision| ConfigSnapshotFingerprint::ProviderEnvironment {
+            provider_env_revision: revision,
+            provider_attachment_epoch: String::new(),
+            policy_hash: String::new(),
+        };
+
+        // The same snapshot the bootstrap carried is held, then dropped.
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", snapshot(7)),
+            DeliveryDisposition::Coalesced
+        );
+        assert!(registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-1",
+            &bootstrap_result(7),
+            Some(&fingerprint(7)),
+        ));
+        assert!(slots.take_for_test().is_none());
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", snapshot(7)),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+
+        // A newer snapshot held behind the bootstrap is sent once it lands.
+        let slots = register_apply_session(&registry, "sb-1", "session-2");
+        registry.await_config_bootstrap("sb-1", "session-2");
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-2", snapshot(8)),
+            DeliveryDisposition::Coalesced
+        );
+        registry.acknowledge_bootstrap_component(
+            "sb-1",
+            "session-2",
+            &bootstrap_result(7),
+            Some(&fingerprint(7)),
+        );
+        assert!(slots.take_for_test().is_some(), "newer snapshot is sent");
+    }
+
+    #[test]
     fn bootstrap_acknowledgement_does_not_replace_newer_delivery_state() {
         let registry = SupervisorSessionRegistry::new();
         let slots = register_apply_session(&registry, "sb-1", "session-1");
@@ -1716,7 +1871,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &bootstrap_fingerprint,
+            Some(&bootstrap_fingerprint),
         ));
 
         let message = slots.take_for_test().ok_or(()).expect("newer update");
@@ -1759,7 +1914,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &bootstrap_fingerprint,
+            Some(&bootstrap_fingerprint),
         ));
     }
 
@@ -1789,7 +1944,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::FailedClosed.into(),
                 ..Default::default()
             },
-            &fingerprint,
+            Some(&fingerprint),
         ));
         assert!(registry.acknowledge_bootstrap_component(
             "sb-1",
@@ -1801,7 +1956,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &fingerprint,
+            Some(&fingerprint),
         ));
         assert_eq!(
             registry.deliver_config(
@@ -2648,7 +2803,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &fingerprint,
+            Some(&fingerprint),
         ));
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", message),
@@ -2684,7 +2839,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &fingerprint,
+            Some(&fingerprint),
         ));
         assert_eq!(
             registry.deliver_config(
@@ -2817,7 +2972,7 @@ mod tests {
                 outcome: ConfigApplyOutcome::Applied.into(),
                 ..Default::default()
             },
-            &config_message_fingerprint(&message),
+            Some(&config_message_fingerprint(&message)),
         ));
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", message),

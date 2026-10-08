@@ -1027,6 +1027,10 @@ mod tests {
     }
 
     async fn put_provider(state: &ServerState, name: &str) {
+        put_provider_with_token(state, name, None).await;
+    }
+
+    async fn put_provider_with_token(state: &ServerState, name: &str, token: Option<&str>) {
         state
             .store
             .put_message(&Provider {
@@ -1037,8 +1041,35 @@ mod tests {
                     ..Default::default()
                 }),
                 r#type: "github".into(),
+                credentials: token
+                    .map(|token| HashMap::from([("GITHUB_TOKEN".to_string(), token.to_string())]))
+                    .unwrap_or_default(),
                 ..Default::default()
             })
+            .await
+            .unwrap();
+    }
+
+    /// Commit a new policy revision, so the next sandbox configuration build
+    /// differs from the bootstrap the session acknowledged.
+    async fn change_policy(state: &ServerState, sandbox_id: &str, version: i64) {
+        use crate::policy_store::PolicyStoreExt as _;
+        use prost::Message as _;
+
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &crate::grpc::policy::deterministic_policy_hash(&policy),
+            )
             .await
             .unwrap();
     }
@@ -1060,6 +1091,28 @@ mod tests {
         let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
             panic!("expected SessionAccepted");
         };
+        // Live updates wait for the bootstrap result, as from a real
+        // supervisor; the gateway answers it with the admission.
+        if let Some(bootstrap) = accepted.bootstrap {
+            harness
+                .outbound
+                .send(openshell_core::proto::SupervisorMessage {
+                    payload: Some(
+                        openshell_core::proto::supervisor_message::Payload::ConfigBootstrapResult(
+                            session::applied_bootstrap_result(&bootstrap),
+                        ),
+                    ),
+                })
+                .await
+                .unwrap();
+            let admission = next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("configuration admission");
+            assert!(matches!(
+                admission.payload,
+                Some(gateway_message::Payload::ConfigurationAdmission(_))
+            ));
+        }
         (harness, accepted.session_id)
     }
 
@@ -1119,6 +1172,7 @@ mod tests {
         let state = push_state().await;
         put_sandbox(&state, "owned-sandbox", &[]).await;
         let (mut harness, session_id) = accepted_session(&state, "owned-sandbox").await;
+        change_policy(&state, "owned-sandbox", 1).await;
 
         let response =
             handle_peer_notify_config_update(&state, peer_notify("owned-sandbox", &session_id))
@@ -1139,6 +1193,7 @@ mod tests {
         put_sandbox(&state, "unattached", &[]).await;
         let (mut attached, _) = accepted_session(&state, "attached").await;
         let (mut unattached, _) = accepted_session(&state, "unattached").await;
+        put_provider_with_token(&state, "github", Some("rotated")).await;
 
         publish_provider_components(&state, "default", "github", ConfigComponents::ALL);
 
@@ -1154,6 +1209,7 @@ mod tests {
                 .is_none()
         );
 
+        change_policy(&state, "unattached", 1).await;
         publish_workspace_components(&state, "default", ConfigComponents::SANDBOX_CONFIG);
         assert!(
             next_update(&mut unattached, Duration::from_secs(5))
@@ -1306,6 +1362,7 @@ mod tests {
         put_sandbox(&state, "sandbox", &[]).await;
         let (mut harness, _) = accepted_session(&state, "sandbox").await;
         assert!(has_recipient(&state, "sandbox"));
+        change_policy(&state, "sandbox", 1).await;
 
         publish_sandbox_components(&state, "sandbox", ConfigComponents::SANDBOX_CONFIG);
         let update = next_update(&mut harness, Duration::from_secs(5))
