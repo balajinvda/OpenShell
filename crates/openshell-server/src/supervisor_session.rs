@@ -384,6 +384,9 @@ struct ComponentDeliveryState {
     in_flight: Option<InFlightConfigUpdate>,
     pending: Option<SupervisorConfigMessage>,
     last_acknowledged_fingerprint: Option<ConfigSnapshotFingerprint>,
+    /// The supervisor staged the last delivered update until its matching
+    /// counterpart arrives, and still owes a result for it.
+    staged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -409,6 +412,25 @@ struct InFlightConfigUpdate {
     fingerprint: ConfigSnapshotFingerprint,
     admission: Option<SandboxConfigurationAdmission>,
     sent_at: Instant,
+}
+
+/// Outcome of finishing an in-flight configuration update.
+#[derive(Debug, PartialEq, Eq)]
+enum Finalized {
+    /// The session or update was replaced before the result was finished.
+    Obsolete,
+    Done {
+        rebuild: Option<ConfigComponentKind>,
+    },
+}
+
+impl Finalized {
+    fn rebuild(&self) -> Option<ConfigComponentKind> {
+        match self {
+            Self::Obsolete => None,
+            Self::Done { rebuild } => *rebuild,
+        }
+    }
 }
 
 struct CompletedConfigUpdate {
@@ -554,6 +576,7 @@ fn build_config_update(
     message: SupervisorConfigMessage,
 ) -> (GatewayMessage, InFlightConfigUpdate) {
     state.sequence = state.sequence.saturating_add(1);
+    state.staged = false;
     let component_sequence = state.sequence;
     let fingerprint = config_message_fingerprint(&message);
     let (component, revision, admission) = match message {
@@ -689,10 +712,6 @@ fn outcome_acknowledges_revision(outcome: ConfigApplyOutcome) -> bool {
             | ConfigApplyOutcome::RetainedLocalOverride
             | ConfigApplyOutcome::Degraded
     )
-}
-
-fn generation_is_pending(result: &ConfigComponentApplyResult) -> bool {
-    result.outcome == i32::from(ConfigApplyOutcome::AwaitingComponent)
 }
 
 impl SupervisorSessionRegistry {
@@ -1019,54 +1038,78 @@ impl SupervisorSessionRegistry {
     /// Finish a validated update after all durable side effects have either
     /// succeeded or failed. Keeping the update in flight until this point
     /// prevents reconciliation from treating a locally reported result as an
-    /// acknowledgement before its observation and admission are durable.
+    /// acknowledgement before its admission is durable.
+    ///
+    /// Returns the component to rebuild now, if any. A staged component waits
+    /// for its counterpart, so the counterpart is rebuilt rather than the
+    /// staged one, which the supervisor would only stage again. Once the
+    /// counterpart is acknowledged, the staged component is rebuilt so the
+    /// supervisor reports the result it still owes. A counterpart that is
+    /// itself staged is not rebuilt, so mismatched halves cannot keep
+    /// requesting each other; the next publication or reconciliation pass
+    /// repairs them.
     fn finalize_config_update(
         &self,
         sandbox_id: &str,
         session_id: &str,
         completed: &CompletedConfigUpdate,
         acknowledge: bool,
-    ) -> bool {
+    ) -> Finalized {
         let mut sessions = self.sessions.lock().unwrap();
         let Some(config) = sessions
             .get_mut(sandbox_id)
             .filter(|session| session.session_id == session_id)
             .and_then(|session| session.config.as_mut())
         else {
-            return false;
+            return Finalized::Obsolete;
         };
         let slots = Arc::clone(&config.slots);
-        let delivery_state = config.component_mut(completed.component);
+        let component = completed.component;
+        let delivery_state = config.component_mut(component);
         let Some(in_flight) = delivery_state.in_flight.as_ref() else {
-            return false;
+            return Finalized::Obsolete;
         };
         if in_flight.update_id != completed.update_id
             || in_flight.component_sequence != completed.component_sequence
             || in_flight.revision != completed.revision
         {
-            return false;
+            return Finalized::Obsolete;
         }
-        if acknowledge && outcome_acknowledges_revision(completed.outcome) {
+        let acknowledged = acknowledge && outcome_acknowledges_revision(completed.outcome);
+        if acknowledged {
             delivery_state.last_acknowledged_fingerprint = Some(completed.fingerprint.clone());
         }
+        let staged = completed.outcome == ConfigApplyOutcome::AwaitingComponent;
+        delivery_state.staged = staged;
         delivery_state.in_flight = None;
-        let Some(pending) = delivery_state.pending.take() else {
-            return true;
+        let pending = delivery_state.pending.take();
+
+        let counterpart = config.component_mut(component.counterpart());
+        let rebuild = if staged {
+            (!counterpart.staged).then_some(component.counterpart())
+        } else if acknowledged {
+            std::mem::take(&mut counterpart.staged).then_some(component.counterpart())
+        } else {
+            None
+        };
+
+        let delivery_state = config.component_mut(component);
+        let Some(pending) = pending else {
+            return Finalized::Done { rebuild };
         };
         if delivery_state.last_acknowledged_fingerprint.as_ref()
             == Some(&config_message_fingerprint(&pending))
         {
-            return true;
+            return Finalized::Done { rebuild };
         }
-        let component = pending.component();
         let (message, next) = build_config_update(delivery_state, pending);
         if message.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
-            return true;
+            return Finalized::Done { rebuild };
         }
         delivery_state.in_flight = Some(next);
         drop(sessions);
         slots.replace(component, message);
-        true
+        Finalized::Done { rebuild }
     }
 
     /// Record a successfully persisted bootstrap result in the live session's
@@ -3661,91 +3704,8 @@ async fn handle_supervisor_message(
             );
         }
         Some(supervisor_message::Payload::ConfigUpdateResult(result)) => {
-            let completed = match state
-                .supervisor_sessions
-                .complete_config_update(sandbox_id, session_id, &result)
-            {
-                Ok(completed) => completed,
-                Err(error) => {
-                    debug!(
-                        sandbox_id,
-                        session_id,
-                        error = %error,
-                        "ignored unmatched supervisor configuration result"
-                    );
-                    return;
-                }
-            };
-            if result.result.as_ref().is_some_and(generation_is_pending) {
-                state
-                    .supervisor_sessions
-                    .finalize_config_update(sandbox_id, session_id, &completed, false);
-                // Either projection can arrive first. Once the supervisor has
-                // staged one half, rebuild both current projections so the
-                // matching half and the deferred admission result are driven
-                // to a fixed point even when no further mutation occurs.
-                crate::config_delivery::publish_sandbox_components(
-                    state,
-                    sandbox_id,
-                    crate::config_delivery::ConfigComponents::ALL,
-                );
-                debug!(
-                    sandbox_id,
-                    session_id,
-                    "supervisor configuration generation is waiting for its matching component; scheduled reconciliation"
-                );
-                return;
-            }
-            if let Some(result) = result.result.as_ref()
-                && let Err(error) = record_component_apply_result(state, sandbox_id, result).await
-            {
-                state
-                    .supervisor_sessions
-                    .finalize_config_update(sandbox_id, session_id, &completed, false);
-                warn!(
-                    sandbox_id,
-                    session_id,
-                    component = result.component,
-                    error = %error,
-                    "failed to persist supervisor configuration result"
-                );
-                return;
-            }
-            if let Some(expected_admission) = completed.admission.as_ref() {
-                let admission = match validate_configuration_admission(
-                    result.admission.as_ref(),
-                    expected_admission,
-                    completed.outcome,
-                ) {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        state
-                            .supervisor_sessions
-                            .finalize_config_update(sandbox_id, session_id, &completed, false);
-                        warn!(sandbox_id, session_id, error = %error, "invalid supervisor configuration admission");
-                        return;
-                    }
-                };
-                let acknowledged = persist_and_ack_admission(
-                    state,
-                    sandbox_id,
-                    session_id,
-                    instance_id,
-                    &admission,
-                    tx,
-                )
+            handle_config_update_result(state, sandbox_id, session_id, instance_id, tx, &result)
                 .await;
-                state.supervisor_sessions.finalize_config_update(
-                    sandbox_id,
-                    session_id,
-                    &completed,
-                    acknowledged,
-                );
-            } else {
-                state
-                    .supervisor_sessions
-                    .finalize_config_update(sandbox_id, session_id, &completed, true);
-            }
         }
         Some(supervisor_message::Payload::ConfigBootstrapResult(result)) => {
             if !stream_applies_config {
@@ -3812,6 +3772,96 @@ async fn handle_supervisor_message(
                 "supervisor session: unexpected message type"
             );
         }
+    }
+}
+
+async fn handle_config_update_result(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    session_id: &str,
+    instance_id: &str,
+    tx: &mpsc::Sender<GatewayMessage>,
+    result: &ConfigUpdateResult,
+) {
+    let completed = match state
+        .supervisor_sessions
+        .complete_config_update(sandbox_id, session_id, result)
+    {
+        Ok(completed) => completed,
+        Err(error) => {
+            debug!(
+                sandbox_id,
+                session_id,
+                error = %error,
+                "ignored unmatched supervisor configuration result"
+            );
+            return;
+        }
+    };
+    let finalized = if completed.outcome == ConfigApplyOutcome::AwaitingComponent {
+        // A transient ordering result is never recorded. The supervisor keeps
+        // this half staged until its counterpart arrives.
+        debug!(
+            sandbox_id,
+            session_id, "supervisor configuration is waiting for its matching component"
+        );
+        state
+            .supervisor_sessions
+            .finalize_config_update(sandbox_id, session_id, &completed, false)
+    } else if let Some(component_result) = result.result.as_ref()
+        && let Err(error) = record_component_apply_result(state, sandbox_id, component_result).await
+    {
+        warn!(
+            sandbox_id,
+            session_id,
+            component = component_result.component,
+            error = %error,
+            "failed to persist supervisor configuration result"
+        );
+        state
+            .supervisor_sessions
+            .finalize_config_update(sandbox_id, session_id, &completed, false)
+    } else if let Some(expected_admission) = completed.admission.as_ref() {
+        match validate_configuration_admission(
+            result.admission.as_ref(),
+            expected_admission,
+            completed.outcome,
+        ) {
+            Ok(admission) => {
+                let acknowledged = persist_and_ack_admission(
+                    state,
+                    sandbox_id,
+                    session_id,
+                    instance_id,
+                    &admission,
+                    tx,
+                )
+                .await;
+                state.supervisor_sessions.finalize_config_update(
+                    sandbox_id,
+                    session_id,
+                    &completed,
+                    acknowledged,
+                )
+            }
+            Err(error) => {
+                warn!(sandbox_id, session_id, error = %error, "invalid supervisor configuration admission");
+                state
+                    .supervisor_sessions
+                    .finalize_config_update(sandbox_id, session_id, &completed, false)
+            }
+        }
+    } else {
+        state
+            .supervisor_sessions
+            .finalize_config_update(sandbox_id, session_id, &completed, true)
+    };
+    if let Some(component) = finalized.rebuild() {
+        crate::config_delivery::publish_sandbox_components(
+            state,
+            sandbox_id,
+            crate::config_delivery::ConfigComponents::only(component),
+        );
     }
 }
 
@@ -4290,7 +4340,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(registry.finalize_config_update("sb-1", "session-1", &completed, true));
+        assert_eq!(
+            registry.finalize_config_update("sb-1", "session-1", &completed, true),
+            Finalized::Done { rebuild: None }
+        );
 
         // The acknowledgement releases only the newest held snapshot.
         let next = sent_update(outbound.next().await.unwrap().unwrap());
@@ -6890,7 +6943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_pending_result_schedules_reconciliation_without_persistence() {
+    async fn awaiting_result_rebuilds_only_the_counterpart_without_persistence() {
         use openshell_core::proto::ConfigurationAdmissionState;
 
         let sandbox_id = "sb-generation-pending-retry";
@@ -6994,31 +7047,256 @@ mod tests {
                 .is_none(),
             "a transient generation mismatch must not persist rejected admission"
         );
-        let redriven_components = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut components = Vec::new();
-            while components.len() < 2 {
-                let Some(gateway_message::Payload::ConfigUpdate(update)) =
-                    tokio_stream::StreamExt::next(&mut session.outbound)
-                        .await
-                        .expect("redriven configuration update")
-                        .expect("outbound frame")
-                        .payload
-                else {
-                    continue;
-                };
-                components.push(match update.component.expect("redriven component") {
-                    config_update::Component::SandboxConfig(_) => ConfigComponent::SandboxConfig,
-                    config_update::Component::ProviderEnvironment(_) => {
-                        ConfigComponent::ProviderEnvironment
-                    }
-                });
-            }
-            components
-        })
+        let redriven = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio_stream::StreamExt::next(&mut session.outbound),
+        )
         .await
-        .expect("generation mismatch schedules prompt reconciliation");
-        assert!(redriven_components.contains(&ConfigComponent::SandboxConfig));
-        assert!(redriven_components.contains(&ConfigComponent::ProviderEnvironment));
+        .expect("the awaited counterpart is rebuilt promptly")
+        .expect("outbound frame")
+        .unwrap();
+        assert!(matches!(
+            sent_update(redriven).component,
+            Some(config_update::Component::ProviderEnvironment(_))
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio_stream::StreamExt::next(&mut session.outbound),
+            )
+            .await
+            .is_err(),
+            "the staged sandbox configuration is not resent"
+        );
+    }
+
+    /// Model a supervisor that stages a component until its counterpart
+    /// arrives, then reports the result it owes once the pair activates.
+    fn finalize_result(
+        registry: &SupervisorSessionRegistry,
+        update: &ConfigUpdate,
+        message: &SupervisorConfigMessage,
+        outcome: ConfigApplyOutcome,
+    ) -> Finalized {
+        let revision = config_message_revision(message);
+        let completed = registry
+            .complete_config_update(
+                "sb-1",
+                "session-1",
+                &ConfigUpdateResult {
+                    update_id: update.update_id.clone(),
+                    component_sequence: update.component_sequence,
+                    result: Some(ConfigComponentApplyResult {
+                        component: ConfigComponent::from(message.component()).into(),
+                        requested_revision: Some(revision.clone()),
+                        applied_revision: (outcome != ConfigApplyOutcome::AwaitingComponent)
+                            .then_some(revision),
+                        outcome: outcome.into(),
+                        ..Default::default()
+                    }),
+                    admission: None,
+                },
+            )
+            .unwrap();
+        registry.finalize_config_update("sb-1", "session-1", &completed, true)
+    }
+
+    #[test]
+    fn staged_component_is_rebuilt_only_after_its_counterpart_is_acknowledged() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let sandbox = sandbox_config(7);
+        let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+            provider_env_revision: 5,
+            ..Default::default()
+        });
+        let send = |message: &SupervisorConfigMessage| {
+            assert_eq!(
+                registry.deliver_config("sb-1", "session-1", message.clone(), false),
+                DeliveryDisposition::Queued
+            );
+            sent_update(slots.take_for_test().expect("delivered update"))
+        };
+
+        let sandbox_update = send(&sandbox);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &sandbox_update,
+                &sandbox,
+                ConfigApplyOutcome::AwaitingComponent
+            ),
+            Finalized::Done {
+                rebuild: Some(ConfigComponentKind::ProviderEnvironment)
+            },
+            "a staged half requests only its counterpart"
+        );
+        let provider_update = send(&provider);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &provider_update,
+                &provider,
+                ConfigApplyOutcome::Applied
+            ),
+            Finalized::Done {
+                rebuild: Some(ConfigComponentKind::SandboxConfig)
+            },
+            "the acknowledged counterpart releases the staged half once"
+        );
+        let sandbox_update = send(&sandbox);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &sandbox_update,
+                &sandbox,
+                ConfigApplyOutcome::IgnoredDuplicate
+            ),
+            Finalized::Done { rebuild: None }
+        );
+
+        // Halves that each wait for the other do not keep requesting rebuilds.
+        let sandbox = sandbox_config(8);
+        let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+            provider_env_revision: 6,
+            ..Default::default()
+        });
+        let sandbox_update = send(&sandbox);
+        let provider_update = send(&provider);
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &sandbox_update,
+                &sandbox,
+                ConfigApplyOutcome::AwaitingComponent
+            ),
+            Finalized::Done {
+                rebuild: Some(ConfigComponentKind::ProviderEnvironment)
+            }
+        );
+        assert_eq!(
+            finalize_result(
+                &registry,
+                &provider_update,
+                &provider,
+                ConfigApplyOutcome::AwaitingComponent
+            ),
+            Finalized::Done { rebuild: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_or_failing_provider_build_cannot_loop_sandbox_config_deliveries() {
+        use openshell_core::proto::{CredentialHandle, Provider};
+
+        let sandbox_id = "sb-staged-sandbox-config";
+        let state = push_state().await;
+        // Resolving this handle fails, so every provider environment build
+        // fails after the gate releases it.
+        state
+            .store
+            .put_message(&Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "provider".into(),
+                    name: "provider".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                r#type: "github".into(),
+                credential_handles: HashMap::from([(
+                    "GITHUB_TOKEN".into(),
+                    CredentialHandle {
+                        driver: "test-static".into(),
+                        handle: "missing".into(),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut sandbox = sandbox_record(sandbox_id, sandbox_id);
+        sandbox.spec = Some(SandboxSpec {
+            providers: vec!["provider".into()],
+            ..Default::default()
+        });
+        state.store.put_message(&sandbox).await.unwrap();
+        let mut session =
+            crate::config_delivery::register_test_apply_session(&state, &sandbox, "session-1");
+        SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL)
+            .publish(
+                sandbox_id,
+                "session-1",
+                "instance-1",
+                1,
+                &state.replica_id,
+                &local_owner_endpoint(&state.replica_id),
+            )
+            .await
+            .unwrap();
+
+        let message = sandbox_config(7);
+        assert_eq!(
+            state.supervisor_sessions.deliver_config(
+                sandbox_id,
+                "session-1",
+                message.clone(),
+                false
+            ),
+            DeliveryDisposition::Queued
+        );
+        let update = sent_update(
+            tokio_stream::StreamExt::next(&mut session.outbound)
+                .await
+                .expect("initial update")
+                .unwrap(),
+        );
+        let (resolve_hit, release_resolve) = state.credentials.gate_next_resolve();
+        let revision = config_message_revision(&message);
+        handle_config_update_result(
+            &state,
+            sandbox_id,
+            "session-1",
+            "instance-1",
+            &session.control,
+            &ConfigUpdateResult {
+                update_id: update.update_id,
+                component_sequence: update.component_sequence,
+                result: Some(ConfigComponentApplyResult {
+                    component: ConfigComponent::SandboxConfig.into(),
+                    requested_revision: Some(revision),
+                    applied_revision: None,
+                    outcome: ConfigApplyOutcome::AwaitingComponent.into(),
+                    failure: None,
+                }),
+                admission: None,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), resolve_hit)
+            .await
+            .expect("the awaited provider environment is rebuilt")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio_stream::StreamExt::next(&mut session.outbound),
+            )
+            .await
+            .is_err(),
+            "a stalled provider build must not resend the staged sandbox configuration"
+        );
+        release_resolve.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio_stream::StreamExt::next(&mut session.outbound),
+            )
+            .await
+            .is_err(),
+            "a failed provider build must not resend the staged sandbox configuration"
+        );
     }
 
     #[tokio::test]

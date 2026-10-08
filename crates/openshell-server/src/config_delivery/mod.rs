@@ -129,7 +129,7 @@ impl ConfigComponents {
         provider_environment: false,
     };
 
-    fn only(component: ConfigComponentKind) -> Self {
+    pub(crate) fn only(component: ConfigComponentKind) -> Self {
         Self {
             sandbox_config: component == ConfigComponentKind::SandboxConfig,
             provider_environment: component == ConfigComponentKind::ProviderEnvironment,
@@ -173,6 +173,14 @@ impl ConfigComponentKind {
             ConfigComponent::SandboxConfig => Some(Self::SandboxConfig),
             ConfigComponent::ProviderEnvironment => Some(Self::ProviderEnvironment),
             ConfigComponent::Unspecified => None,
+        }
+    }
+
+    /// The other half of a configuration generation.
+    pub(crate) fn counterpart(self) -> Self {
+        match self {
+            Self::SandboxConfig => Self::ProviderEnvironment,
+            Self::ProviderEnvironment => Self::SandboxConfig,
         }
     }
 
