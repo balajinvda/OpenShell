@@ -1368,31 +1368,29 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
     }
 }
 
+/// Delivered snapshots go through the polling projection, so both paths
+/// apply the same defaults and validation.
 impl From<crate::proto::SandboxConfigSnapshot> for SettingsPollResult {
-    fn from(inner: crate::proto::SandboxConfigSnapshot) -> Self {
-        Self {
-            configuration_instance_id: inner.configuration_instance_id,
-            configuration_admitted: inner.configuration_admitted,
-            configuration_error: inner.configuration_error,
-            policy: inner.policy,
-            version: inner.version,
-            policy_hash: inner.policy_hash,
-            config_revision: inner.config_revision,
-            settings_revision: inner.settings_revision,
-            policy_source: PolicySource::try_from(inner.policy_source)
-                .unwrap_or(PolicySource::Unspecified),
-            settings: inner.settings,
-            global_policy_version: inner.global_policy_version,
-            provider_env_revision: inner.provider_env_revision,
-            provider_attachment_epoch: inner.provider_attachment_epoch,
-            supervisor_middleware_services: inner.supervisor_middleware_services,
-            workspace: inner.workspace,
-            policy_validation_failure_mode: inner
-                .policy_validation_failure_mode
-                .parse()
-                .unwrap_or_default(),
-            extension_authentication_enabled: inner.extension_authentication_enabled,
-        }
+    fn from(snapshot: crate::proto::SandboxConfigSnapshot) -> Self {
+        settings_poll_result(crate::proto::GetSandboxConfigResponse {
+            policy: snapshot.policy,
+            version: snapshot.version,
+            policy_hash: snapshot.policy_hash,
+            settings: snapshot.settings,
+            config_revision: snapshot.config_revision,
+            policy_source: snapshot.policy_source,
+            global_policy_version: snapshot.global_policy_version,
+            provider_env_revision: snapshot.provider_env_revision,
+            supervisor_middleware_services: snapshot.supervisor_middleware_services,
+            workspace: snapshot.workspace,
+            policy_validation_failure_mode: snapshot.policy_validation_failure_mode,
+            extension_authentication_enabled: snapshot.extension_authentication_enabled,
+            configuration_admitted: snapshot.configuration_admitted,
+            provider_attachment_epoch: snapshot.provider_attachment_epoch,
+            configuration_instance_id: snapshot.configuration_instance_id,
+            configuration_error: snapshot.configuration_error,
+            settings_revision: snapshot.settings_revision,
+        })
     }
 }
 

@@ -11,8 +11,8 @@
 //! selection — it has no protocol awareness of the bytes flowing through.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openshell_core::grpc_client::SettingsPollResult;
@@ -98,12 +98,6 @@ impl PreparedSupervisorSession {
     pub fn uses_stream_configuration(&self) -> bool {
         self.config_apply_enabled
     }
-}
-
-#[derive(Default)]
-struct ConfigSequenceWatermarks {
-    sandbox_config: u64,
-    provider_environment: u64,
 }
 
 /// Revision token the gateway correlates with a sandbox configuration result.
@@ -1095,7 +1089,6 @@ async fn run_prepared_session(
         .await
         .map_err(|_| "failed to queue configuration bootstrap result")?;
     }
-    let config_sequences = Arc::new(Mutex::new(ConfigSequenceWatermarks::default()));
     if let Some(updates) = &config.config_apply_updates {
         updates.send_replace(prepared.config_apply_enabled);
     }
@@ -1150,7 +1143,6 @@ async fn run_prepared_session(
                     tx: &tx,
                     terminating: &config.terminating,
                     config_apply_tx,
-                    config_sequences: &config_sequences,
                     ready_tx: &config.ready_tx,
                     runtime_ready: &config.runtime_ready,
                 };
@@ -1285,7 +1277,6 @@ struct GatewayMessageContext<'a> {
     tx: &'a mpsc::Sender<SupervisorMessage>,
     terminating: &'a Arc<AtomicBool>,
     config_apply_tx: Option<&'a mpsc::Sender<ConfigApplyRequest>>,
-    config_sequences: &'a Arc<Mutex<ConfigSequenceWatermarks>>,
     ready_tx: &'a watch::Sender<bool>,
     runtime_ready: &'a Arc<AtomicBool>,
 }
@@ -1331,25 +1322,6 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let invalid_update = update.update_id.is_empty()
                 || update.component_sequence == 0
                 || update.component.is_none();
-            let stale_sequence = if invalid_update {
-                false
-            } else {
-                let mut watermarks = context.config_sequences.lock().unwrap();
-                let watermark = if matches!(
-                    update.component,
-                    Some(config_update::Component::ProviderEnvironment(_))
-                ) {
-                    &mut watermarks.provider_environment
-                } else {
-                    &mut watermarks.sandbox_config
-                };
-                if update.component_sequence <= *watermark {
-                    true
-                } else {
-                    *watermark = update.component_sequence;
-                    false
-                }
-            };
             tokio::spawn(async move {
                 let result = if invalid_update {
                     unapplied_update(
@@ -1357,13 +1329,6 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                         ConfigApplyOutcome::Unsupported,
                         "invalid_update",
                         "configuration update identity, sequence, and component are required",
-                    )
-                } else if stale_sequence {
-                    unapplied_update(
-                        update,
-                        ConfigApplyOutcome::IgnoredStale,
-                        "stale_sequence",
-                        "configuration update sequence is stale",
                     )
                 } else {
                     apply_update(&apply_tx, update).await

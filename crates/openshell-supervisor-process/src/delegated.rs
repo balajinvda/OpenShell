@@ -385,6 +385,46 @@ pub async fn finalize_main_process_exit(endpoint: &str, sandbox_id: &str, instan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct CountingConnector {
+        connects: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BoundaryLoopbackConnector for CountingConnector {
+        async fn connect(
+            &self,
+            _target: LoopbackTarget,
+        ) -> Result<BoundaryDuplexStream, BackendError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(tokio::io::duplex(8).0))
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_loopback_waits_for_the_boundary_connector() {
+        let deferred = Arc::new(DeferredLoopbackConnector::default());
+        let target = LoopbackTarget::new(std::net::Ipv4Addr::LOCALHOST.into(), 22).unwrap();
+        let pending = tokio::spawn({
+            let deferred = Arc::clone(&deferred);
+            let target = target.clone();
+            async move { deferred.connect(target).await.map(|_| ()) }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!pending.is_finished(), "connect waits until install");
+
+        let connector = Arc::new(CountingConnector::default());
+        deferred
+            .install(Arc::<CountingConnector>::clone(&connector))
+            .await;
+        pending.await.unwrap().unwrap();
+        deferred.connect(target).await.unwrap();
+        assert_eq!(connector.connects.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn expected_post_exit_attachment_is_preserved_for_remote_main() {
