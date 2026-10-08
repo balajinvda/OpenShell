@@ -555,7 +555,7 @@ async fn reconcile_records_for_sandbox(
             == Some(false)
     {
         let components = if records.iter().any(targets_policy) {
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+            crate::config_delivery::ConfigComponents::ALL
         } else {
             crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
         };
@@ -612,7 +612,7 @@ async fn reconcile_records_for_sandbox(
     // recoverable when the claim's retry deadline expires.
     let publish_provider_environment = claimed_records.iter().any(targets_policy);
     let components = if publish_provider_environment {
-        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
+        crate::config_delivery::ConfigComponents::ALL
     } else {
         crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
     };

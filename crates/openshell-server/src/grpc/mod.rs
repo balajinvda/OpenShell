@@ -1037,22 +1037,10 @@ pub mod test_support {
     /// Configuration stream features advertised by a test supervisor hello.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum StreamFeatures {
-        /// Predates configuration snapshots.
+        /// Predates streamed configuration and keeps polling.
         Legacy,
-        /// Accepts shadow snapshots while polling stays authoritative.
-        Snapshots,
         /// Applies and acknowledges streamed configuration.
         Apply,
-    }
-
-    impl From<bool> for StreamFeatures {
-        fn from(supports_config_snapshots: bool) -> Self {
-            if supports_config_snapshots {
-                Self::Snapshots
-            } else {
-                Self::Legacy
-            }
-        }
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
@@ -1061,9 +1049,9 @@ pub mod test_support {
     pub async fn connect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
-        features: impl Into<StreamFeatures>,
+        features: StreamFeatures,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
-        connect_supervisor_stream_with_image_policy(state, sandbox_id, features.into(), None).await
+        connect_supervisor_stream_with_image_policy(state, sandbox_id, features, None).await
     }
 
     pub async fn connect_supervisor_stream_with_image_policy(
@@ -1098,19 +1086,21 @@ pub mod test_support {
             sandbox_id,
             features,
             Some(image_policy_discovery),
+            0,
         )
         .await
     }
 
     /// Model a stock supervisor reconnect, which omits the one-shot image
-    /// policy discovery after its initial session has been prepared.
+    /// policy discovery after its initial session has been prepared and
+    /// advances its connection epoch.
     pub async fn reconnect_supervisor_stream(
         state: &Arc<ServerState>,
         sandbox_id: &str,
         features: StreamFeatures,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         connect_supervisor_stream_with_optional_image_policy_discovery(
-            state, sandbox_id, features, None,
+            state, sandbox_id, features, None, 1,
         )
         .await
     }
@@ -1120,6 +1110,7 @@ pub mod test_support {
         sandbox_id: &str,
         features: StreamFeatures,
         image_policy_discovery: Option<openshell_core::proto::ImagePolicyDiscovery>,
+        connection_epoch: u64,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1151,7 +1142,7 @@ pub mod test_support {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
                     supports_config_apply: features == StreamFeatures::Apply,
-                    connection_epoch: 0,
+                    connection_epoch,
                     image_policy_discovery,
                     supports_provider_readiness: false,
                     redirected: false,

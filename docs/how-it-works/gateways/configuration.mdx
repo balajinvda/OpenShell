@@ -179,8 +179,8 @@ image_preparation_timeout_seconds = 1800
 policy_validation_failure_mode = "fail_closed"
 
 # How supervisors receive configuration. "poll" keeps periodic polling.
-# "push" also sends configuration over the supervisor session; supervisors
-# that do not support streamed configuration keep polling.
+# "push" sends configuration over the supervisor session to supervisors that
+# apply it; supervisors that do not support streamed configuration keep polling.
 config_delivery_mode = "poll"
 
 # Subject Alternative Names baked into the gateway server certificate.

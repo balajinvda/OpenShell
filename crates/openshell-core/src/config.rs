@@ -48,9 +48,9 @@ pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Gateway delivery path for supervisor configuration.
 ///
-/// `Push` sends configuration over the supervisor session. Supervisors that
-/// apply streamed configuration stop polling; others keep polling and treat the
-/// stream as a shadow.
+/// `Push` sends configuration over the supervisor session to supervisors that
+/// apply streamed configuration, which then stop polling. Other supervisors
+/// keep polling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigDeliveryMode {

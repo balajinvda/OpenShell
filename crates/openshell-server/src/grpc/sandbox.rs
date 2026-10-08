@@ -1473,7 +1473,7 @@ pub(super) async fn handle_attach_sandbox_provider(
         crate::config_delivery::publish_sandbox_components(
             state,
             &sandbox_id,
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+            crate::config_delivery::ConfigComponents::ALL,
         );
         state.sandbox_watch_bus.notify(&sandbox_id);
     }
@@ -1604,7 +1604,7 @@ pub(super) async fn handle_detach_sandbox_provider(
         crate::config_delivery::publish_sandbox_components(
             state,
             &sandbox_id,
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+            crate::config_delivery::ConfigComponents::ALL,
         );
         state.sandbox_watch_bus.notify(&sandbox_id);
     }

@@ -1922,7 +1922,7 @@ async fn auto_approve_chunk(
     crate::config_delivery::publish_sandbox_components(
         state,
         sandbox_id,
-        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+        crate::config_delivery::ConfigComponents::ALL,
     );
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
@@ -4115,7 +4115,7 @@ async fn handle_update_config_inner(
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
                     crate::config_delivery::publish_all_connected(
                         state,
-                        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+                        crate::config_delivery::ConfigComponents::ALL,
                     );
                 }
                 return Ok(update_config_response(
@@ -4175,7 +4175,7 @@ async fn handle_update_config_inner(
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
                 crate::config_delivery::publish_all_connected(
                     state,
-                    crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+                    crate::config_delivery::ConfigComponents::ALL,
                 );
             }
 
@@ -4225,7 +4225,7 @@ async fn handle_update_config_inner(
             save_global_settings(state.store.as_ref(), &global_settings).await?;
             crate::config_delivery::publish_all_connected(
                 state,
-                crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+                crate::config_delivery::ConfigComponents::ALL,
             );
 
             if req.delete_setting
@@ -5955,7 +5955,7 @@ async fn handle_approve_draft_chunk_inner(
     crate::config_delivery::publish_sandbox_components(
         state,
         &sandbox_id,
-        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+        crate::config_delivery::ConfigComponents::ALL,
     );
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
@@ -6076,7 +6076,7 @@ async fn handle_reject_draft_chunk_inner(
         crate::config_delivery::publish_sandbox_components(
             state,
             &sandbox_id,
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+            crate::config_delivery::ConfigComponents::ALL,
         );
         emit_gateway_policy_audit_log(
             &sandbox_id,
@@ -6367,7 +6367,7 @@ async fn handle_approve_all_draft_chunks_inner(
         crate::config_delivery::publish_sandbox_components(
             state,
             &sandbox_id,
-            crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+            crate::config_delivery::ConfigComponents::ALL,
         );
     }
 
@@ -6562,7 +6562,7 @@ async fn handle_undo_draft_chunk_inner(
     crate::config_delivery::publish_sandbox_components(
         state,
         &sandbox_id,
-        crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER,
+        crate::config_delivery::ConfigComponents::ALL,
     );
 
     // Clear any prior rejection_reason on the way back to "pending" so an
@@ -13212,62 +13212,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_mode_operation_finishes_for_a_polling_supervisor() {
-        let mut state = test_server_state().await;
-        crate::grpc::test_support::enable_push_delivery(&mut state);
-        let sandbox = test_sandbox(
-            "sb-shadow-operation",
-            "shadow-operation",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-        // A snapshot-only session keeps polling and never reports results.
-        let _session =
-            crate::config_delivery::register_test_push_session(&state, &sandbox, "session-1");
-        crate::supervisor_owner::SupervisorOwnerIndex::new(
-            Arc::clone(&state.store),
-            crate::supervisor_owner::OWNER_TTL,
-        )
-        .publish(
-            "sb-shadow-operation",
-            "session-1",
-            "test-supervisor",
-            1,
-            &state.replica_id,
-            "local://test",
-        )
-        .await
-        .unwrap();
-
-        let response = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                sandbox: sandbox.object_name().to_string(),
-                setting_key: "ocsf_json_enabled".to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
-                wait_timeout: openshell_core::time::duration_from_std(
-                    std::time::Duration::from_secs(5),
-                )
-                .ok(),
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let operation = response.operation.expect("push mode tracks the operation");
-        assert_eq!(
-            openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state).unwrap(),
-            openshell_core::proto::ConfigUpdateOperationState::Inactive
-        );
-    }
-
-    #[tokio::test]
     async fn committed_policy_update_publishes_complete_snapshot() {
         let mut state = test_server_state().await;
         Arc::get_mut(&mut state)
@@ -13284,7 +13228,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let mut session =
-            crate::config_delivery::register_test_push_session(&state, &sandbox, "session-1");
+            crate::config_delivery::register_test_apply_session(&state, &sandbox, "session-1");
         let owner_index = crate::supervisor_owner::SupervisorOwnerIndex::new(
             Arc::clone(&state.store),
             crate::supervisor_owner::OWNER_TTL,

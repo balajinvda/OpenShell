@@ -15,7 +15,7 @@ use futures::StreamExt;
 use metrics::counter;
 use openshell_core::config::ConfigDeliveryMode;
 use openshell_core::proto::{
-    ConfigBootstrap, PeerConfigProviderTarget, PeerConfigSandboxTarget,
+    ConfigBootstrap, ConfigComponent, PeerConfigProviderTarget, PeerConfigSandboxTarget,
     PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, ProviderEnvironmentSnapshot,
     Sandbox, SandboxConfigSnapshot, peer_notify_config_update_request,
 };
@@ -28,7 +28,6 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::grpc::policy::{build_provider_environment_snapshot, build_sandbox_config_snapshot};
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
-use crate::supervisor_session::SupervisorSessionRegistry;
 
 pub use queue::Registration;
 use queue::{
@@ -46,13 +45,10 @@ const SANDBOX_CONFIG_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Provider environment builds also resolve credentials. Covers a cold Vault
 /// Kubernetes-auth login plus a read at the default 10-second request timeout.
 const PROVIDER_ENVIRONMENT_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
-// A shadow bootstrap is optional. Keep credential backend stalls well below
-// the 15-second relay session-wait budget while polling remains authoritative.
-pub const OPTIONAL_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
 // Streamed-apply supervisors start from the bootstrap, so allow several
 // concurrent component builds, including revision-mismatch retries, before
 // rejecting the session. Session setup does not hold a delivery build slot.
-pub const REQUIRED_CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
+pub const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 /// Concurrent snapshot builds allowed per pooled database connection. Builds
 /// are short bursts of small queries, so a little oversubscription keeps the
 /// pool busy without stacking every waiter on the acquire timeout.
@@ -116,46 +112,6 @@ impl DeliveryDisposition {
     }
 }
 
-/// Transport boundary for configuration delivery.
-#[tonic::async_trait]
-pub trait SupervisorConfigTransport: fmt::Debug + Send + Sync {
-    /// `require_acknowledgement` resends an unchanged snapshot because a
-    /// pending durable operation needs the supervisor's result for it.
-    async fn deliver(
-        &self,
-        sandbox_id: &str,
-        session_id: &str,
-        message: SupervisorConfigMessage,
-        require_acknowledgement: bool,
-    ) -> DeliveryDisposition;
-}
-
-#[derive(Debug)]
-pub struct LocalSupervisorConfigTransport {
-    sessions: Arc<SupervisorSessionRegistry>,
-}
-
-impl LocalSupervisorConfigTransport {
-    #[must_use]
-    pub fn new(sessions: Arc<SupervisorSessionRegistry>) -> Self {
-        Self { sessions }
-    }
-}
-
-#[tonic::async_trait]
-impl SupervisorConfigTransport for LocalSupervisorConfigTransport {
-    async fn deliver(
-        &self,
-        sandbox_id: &str,
-        session_id: &str,
-        message: SupervisorConfigMessage,
-        require_acknowledgement: bool,
-    ) -> DeliveryDisposition {
-        self.sessions
-            .deliver_config(sandbox_id, session_id, message, require_acknowledgement)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConfigComponents {
     pub sandbox_config: bool,
@@ -164,11 +120,6 @@ pub struct ConfigComponents {
 
 impl ConfigComponents {
     pub const ALL: Self = Self {
-        sandbox_config: true,
-        provider_environment: true,
-    };
-
-    pub const SANDBOX_AND_PROVIDER: Self = Self {
         sandbox_config: true,
         provider_environment: true,
     };
@@ -216,10 +167,28 @@ pub enum ConfigComponentKind {
 }
 
 impl ConfigComponentKind {
+    /// The delivered component named by a wire value, if it is one.
+    pub(crate) fn from_proto(component: i32) -> Option<Self> {
+        match ConfigComponent::try_from(component).ok()? {
+            ConfigComponent::SandboxConfig => Some(Self::SandboxConfig),
+            ConfigComponent::ProviderEnvironment => Some(Self::ProviderEnvironment),
+            ConfigComponent::Unspecified => None,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::SandboxConfig => "sandbox_config",
             Self::ProviderEnvironment => "provider_environment",
+        }
+    }
+}
+
+impl From<ConfigComponentKind> for ConfigComponent {
+    fn from(component: ConfigComponentKind) -> Self {
+        match component {
+            ConfigComponentKind::SandboxConfig => Self::SandboxConfig,
+            ConfigComponentKind::ProviderEnvironment => Self::ProviderEnvironment,
         }
     }
 }
@@ -273,11 +242,13 @@ impl ConfigDelivery {
 pub async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
-    timeout: Duration,
 ) -> Result<ConfigBootstrap, Status> {
-    tokio::time::timeout(timeout, build_consistent_config_bootstrap(state, sandbox))
-        .await
-        .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
+    tokio::time::timeout(
+        CONFIG_BOOTSTRAP_BUILD_TIMEOUT,
+        build_consistent_config_bootstrap(state, sandbox),
+    )
+    .await
+    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
 }
 
 async fn build_consistent_config_bootstrap(
@@ -388,7 +359,7 @@ fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope, components: Con
     kick(state);
 }
 
-/// Make a push-capable session visible to fanouts and sandbox updates.
+/// Make a streamed-apply session visible to fanouts and sandbox updates.
 pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     state.config_delivery.with_queue(|queue| {
         // A concurrent reconnect may already own the registry entry. Checking
@@ -590,35 +561,13 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
     record_build(key.component, *lane, "ok");
     let owner_moved = match owner_check(state, &key.sandbox_id, session_id).await {
         OwnerCheck::Current => {
-            let disposition = state
-                .supervisor_config_transport()
-                .deliver(
-                    &key.sandbox_id,
-                    session_id,
-                    message,
-                    require_acknowledgement,
-                )
-                .await;
+            let disposition = state.supervisor_sessions.deliver_config(
+                &key.sandbox_id,
+                session_id,
+                message,
+                require_acknowledgement,
+            );
             record_delivery(key.component, disposition.metric_label());
-            // A session that keeps polling never reports a result for the
-            // pending operations bound to this snapshot. A replaced session
-            // says nothing about its successor, which may apply.
-            if require_acknowledgement
-                && disposition != DeliveryDisposition::NoActiveSession
-                && state
-                    .supervisor_sessions
-                    .session_applies_config(&key.sandbox_id, session_id)
-                    == Some(false)
-                && let Err(error) =
-                    crate::config_update_operation::finish_pending_untracked(state, &key.sandbox_id)
-                        .await
-            {
-                warn!(
-                    sandbox_id = %key.sandbox_id,
-                    error = %error,
-                    "failed to finish configuration operations for a polling supervisor"
-                );
-            }
             false
         }
         OwnerCheck::Remote => {
@@ -919,8 +868,8 @@ pub fn handle_peer_notify_config_update(
                     queue.publish_sandbox(&target.sandbox_id, components, Instant::now())
                 });
                 kick(state);
-                // A session without snapshot support is never registered, so
-                // no build reaches the operations a peer is reconciling.
+                // A polling session is never registered, so no build reaches
+                // the operations a peer is reconciling.
                 let state = Arc::clone(state);
                 let sandbox_id = target.sandbox_id;
                 tokio::spawn(async move {
@@ -971,56 +920,31 @@ pub fn handle_peer_notify_config_update(
     Ok(Response::new(response))
 }
 
-/// Supervisor session registered for configuration push without a gRPC stream.
+/// Streamed-apply supervisor session registered without a gRPC stream. It
+/// holds each component until the previous update is acknowledged.
 #[cfg(test)]
-pub struct TestPushSession {
+pub struct TestApplySession {
     pub control: tokio::sync::mpsc::Sender<openshell_core::proto::GatewayMessage>,
     pub outbound: SessionOutbound,
 }
 
 #[cfg(test)]
-pub fn register_test_push_session(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-    session_id: &str,
-) -> TestPushSession {
-    register_test_session(state, sandbox, session_id, false)
-}
-
-/// Register a streamed-apply session, which holds each component until the
-/// previous update is acknowledged.
-#[cfg(test)]
 pub fn register_test_apply_session(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
     session_id: &str,
-) -> TestPushSession {
-    register_test_session(state, sandbox, session_id, true)
-}
-
-#[cfg(test)]
-fn register_test_session(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-    session_id: &str,
-    config_apply: bool,
-) -> TestPushSession {
+) -> TestApplySession {
     use crate::persistence::{ObjectId, ObjectWorkspace};
 
     let (control, rx) = tokio::sync::mpsc::channel(4);
     let slots = Arc::new(ConfigSlots::default());
     let sandbox_id = sandbox.object_id().to_string();
-    state.supervisor_sessions.register_with_config_slots(
+    state.supervisor_sessions.register_with_mode(
         sandbox_id.clone(),
         session_id.to_string(),
         control.clone(),
         tokio::sync::oneshot::channel().0,
-        Some(Arc::clone(&slots)),
-        if config_apply {
-            crate::supervisor_session::SessionMode::ConfigApply
-        } else {
-            crate::supervisor_session::SessionMode::Legacy
-        },
+        crate::supervisor_session::SessionMode::ConfigApply(Arc::clone(&slots)),
     );
     register_session(
         state,
@@ -1034,10 +958,9 @@ fn register_test_session(
                 .map(|spec| spec.providers.iter().cloned().collect())
                 .unwrap_or_default(),
             captured_seq: state.config_delivery.current_seq(),
-            bootstrap_built: true,
         },
     );
-    TestPushSession {
+    TestApplySession {
         control,
         outbound: SessionOutbound::new(rx, slots),
     }
@@ -1107,7 +1030,8 @@ fn record_peer_notify(outcome: &'static str) {
 mod tests {
     use super::*;
     use crate::grpc::test_support::{
-        SupervisorStreamHarness, connect_supervisor_stream, test_server_state,
+        StreamFeatures, SupervisorStreamHarness, connect_supervisor_stream,
+        reconnect_supervisor_stream, test_server_state,
     };
     use openshell_core::proto::{
         GatewayMessage, ObjectMeta, Provider, SandboxSpec, gateway_message,
@@ -1185,11 +1109,13 @@ mod tests {
             .unwrap();
     }
 
+    /// Connect a streamed-apply supervisor. Without image policy discovery the
+    /// gateway skips startup preparation and accepts it with its bootstrap.
     async fn accepted_session(
         state: &Arc<ServerState>,
         sandbox_id: &str,
     ) -> (SupervisorStreamHarness, String) {
-        let mut harness = connect_supervisor_stream(state, sandbox_id, true)
+        let mut harness = reconnect_supervisor_stream(state, sandbox_id, StreamFeatures::Apply)
             .await
             .unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), harness.inbound.message())
@@ -1341,7 +1267,7 @@ mod tests {
                 "moved",
                 "remote-session",
                 "instance",
-                1,
+                2,
                 "other-replica",
                 "http://127.0.0.1:9",
             )
@@ -1384,7 +1310,6 @@ mod tests {
                     workspace: "default".into(),
                     providers: HashSet::new(),
                     captured_seq: 0,
-                    bootstrap_built: true,
                 },
                 Instant::now(),
             );
@@ -1462,12 +1387,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_supervisor_keeps_polling_when_gateway_shadow_push_is_enabled() {
+    async fn legacy_supervisor_keeps_polling_when_gateway_push_is_enabled() {
         let state = push_state().await;
         put_sandbox(&state, "legacy-sandbox", &[]).await;
-        let mut harness = connect_supervisor_stream(&state, "legacy-sandbox", false)
-            .await
-            .unwrap();
+        let mut harness =
+            connect_supervisor_stream(&state, "legacy-sandbox", StreamFeatures::Legacy)
+                .await
+                .unwrap();
         let first = harness.inbound.message().await.unwrap().unwrap();
         let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
             panic!("expected SessionAccepted");
@@ -1504,10 +1430,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_credentials_do_not_block_session_acceptance() {
-        use openshell_core::proto::CredentialHandle;
+    async fn stalled_credentials_keep_the_live_session_serving_relays() {
+        use openshell_core::proto::{StartupConfigPrepared, SupervisorMessage, supervisor_message};
 
         let state = push_state().await;
+        let credential_handles = state
+            .credentials
+            .store_provider_credentials(
+                "provider",
+                "default",
+                "provider",
+                &HashMap::from([("GITHUB_TOKEN".to_string(), "token".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
         state
             .store
             .put_message(&Provider {
@@ -1518,49 +1455,115 @@ mod tests {
                     ..Default::default()
                 }),
                 r#type: "github".into(),
-                credential_handles: HashMap::from([(
-                    "GITHUB_TOKEN".into(),
-                    CredentialHandle {
-                        driver: "test-static".into(),
-                        handle: "blocked".into(),
-                        ..Default::default()
-                    },
-                )]),
+                credential_handles,
                 ..Default::default()
             })
             .await
             .unwrap();
-        put_sandbox(&state, "sandbox", &["provider"]).await;
-        let (resolve_hit, _release_resolve) = state.credentials.gate_next_resolve();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let connect = connect_supervisor_stream(&state, "sandbox", true);
-            let (response, hit) = tokio::join!(connect, resolve_hit);
-            hit.expect("bootstrap must reach the stalled credential driver");
-            let mut harness = response.unwrap();
-            let first = harness.inbound.message().await.unwrap().unwrap();
-            let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
-                panic!("expected session acceptance");
-            };
-            assert!(accepted.bootstrap.is_none());
-            assert!(
-                state
-                    .supervisor_sessions
-                    .is_current_session("sandbox", &accepted.session_id)
-            );
-            // Relay control remains usable while credential resolution is stalled.
-            let (_, relay) = state
-                .supervisor_sessions
-                .open_relay("sandbox", Duration::from_secs(1))
+        // A stored gateway policy leaves startup preparation nothing to persist,
+        // so no publication follows the first session.
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "sandbox".into(),
+                    name: "sandbox".into(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider".into()],
+                    policy: Some(openshell_policy::restrictive_default_policy()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut live = connect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply)
+            .await
+            .unwrap();
+        let Some(gateway_message::Payload::StartupConfigCandidate(candidate)) =
+            next_update(&mut live, Duration::from_secs(5))
                 .await
-                .unwrap();
-            let message = harness.inbound.message().await.unwrap().unwrap();
-            assert!(matches!(
-                message.payload,
-                Some(gateway_message::Payload::RelayOpen(_))
-            ));
-            drop(relay);
-        })
-        .await
-        .expect("optional bootstrap must not consume the relay reconnect budget");
+                .expect("startup candidate")
+                .payload
+        else {
+            panic!("expected StartupConfigCandidate");
+        };
+        live.outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::StartupConfigPrepared(
+                    StartupConfigPrepared {
+                        candidate_id: candidate.candidate_id,
+                        result: Some(
+                            openshell_core::proto::startup_config_prepared::Result::Unchanged(()),
+                        ),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            next_update(&mut live, Duration::from_secs(5))
+                .await
+                .expect("session acceptance")
+                .payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        let live_session = accepted.session_id;
+
+        let (resolve_hit, release_resolve) = state.credentials.gate_next_resolve();
+        let reconnect = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { reconnect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), resolve_hit)
+            .await
+            .expect("reconnect bootstrap must reach the stalled credential driver")
+            .unwrap();
+
+        // The bootstrap is built before the reconnect is registered, so the
+        // live session keeps serving relays while credentials are stalled.
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sandbox", &live_session)
+        );
+        let (_, relay) = state
+            .supervisor_sessions
+            .open_relay("sandbox", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_update(&mut live, Duration::from_secs(5))
+                .await
+                .expect("relay open")
+                .payload,
+            Some(gateway_message::Payload::RelayOpen(_))
+        ));
+        drop(relay);
+
+        release_resolve.send(()).unwrap();
+        let mut replacement = tokio::time::timeout(Duration::from_secs(5), reconnect)
+            .await
+            .expect("released bootstrap completes the reconnect")
+            .unwrap()
+            .unwrap();
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            next_update(&mut replacement, Duration::from_secs(5))
+                .await
+                .expect("replacement acceptance")
+                .payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert!(accepted.bootstrap.is_some());
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sandbox", &accepted.session_id)
+        );
     }
 }

@@ -168,7 +168,6 @@ pub struct Registration {
     pub providers: HashSet<String>,
     /// `current_seq()` observed before the bootstrap build started.
     pub captured_seq: u64,
-    pub bootstrap_built: bool,
 }
 
 #[derive(Debug, Default)]
@@ -336,14 +335,12 @@ impl DeliveryQueue {
             workspace,
             providers,
             captured_seq,
-            bootstrap_built,
         } = registration;
         self.remove_recipient(&sandbox_id);
         self.next_epoch += 1;
-        let built_seq = if bootstrap_built { captured_seq } else { 0 };
         let built = || KeyState {
-            last_build_seq: built_seq,
-            rollback_seq: built_seq,
+            last_build_seq: captured_seq,
+            rollback_seq: captured_seq,
             ..KeyState::default()
         };
         self.by_workspace
@@ -779,7 +776,6 @@ mod tests {
             workspace: workspace.to_string(),
             providers: providers.iter().map(ToString::to_string).collect(),
             captured_seq: 0,
-            bootstrap_built: true,
         }
     }
 
