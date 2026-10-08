@@ -157,9 +157,26 @@ async fn streamed_policy_update_completes_its_operation() {
         list.output
     );
 
-    // Resubmitting the effective policy creates no revision, but the request
-    // still completes against the revision the supervisor already runs.
-    set_policy_and_wait(&guard.name, &updated).await;
+    // Resubmitting the effective policy creates no revision. The gateway still
+    // waits for the supervisor to confirm the revision it already runs, so a
+    // stuck unchanged-request operation fails this call by timing out.
+    let path = updated.path().to_str().expect("UTF-8 policy path");
+    let unchanged = run_cli(&[
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await;
+    assert!(
+        unchanged.success && unchanged.output.contains("Policy unchanged"),
+        "resubmitting the effective policy should complete unchanged:\n{}",
+        unchanged.output
+    );
     assert_eq!(policy_version(&guard.name).await, updated_version);
 
     guard.cleanup().await;
