@@ -45,11 +45,7 @@ use crate::gateway_metrics::{
     RoutedRequestTimer,
 };
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
-use crate::persistence::{
-    CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE, ObjectId, ObjectType, ObjectWorkspace,
-    current_time_ms,
-};
-use crate::storage_proto::StoredConfigComponentObservation;
+use crate::persistence::{ObjectId, ObjectWorkspace};
 use crate::supervisor_owner::{
     OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex, can_supersede,
 };
@@ -310,12 +306,6 @@ impl PeerRouteCache {
 #[cfg(test)]
 static FAIL_NEXT_ADMISSION_PERSISTENCE_FOR_SANDBOX: std::sync::LazyLock<Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
-
-impl ObjectType for StoredConfigComponentObservation {
-    fn object_type() -> &'static str {
-        CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -4012,7 +4002,6 @@ async fn record_component_apply_result(
         "outcome" => outcome.as_str_name(),
     )
     .increment(1);
-    record_config_component_observation(state, sandbox_id, component, outcome, result).await?;
     crate::config_update_operation::complete_from_apply_result(state, sandbox_id, result).await?;
     if component != ConfigComponent::SandboxConfig {
         return Ok(());
@@ -4054,69 +4043,6 @@ async fn record_component_apply_result(
         "stream",
     )
     .await
-}
-
-async fn record_config_component_observation(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    component: ConfigComponent,
-    outcome: ConfigApplyOutcome,
-    result: &ConfigComponentApplyResult,
-) -> Result<(), Status> {
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(sandbox_id)
-        .await
-        .map_err(|error| {
-            Status::internal(format!("fetch sandbox for observation failed: {error}"))
-        })?
-        .ok_or_else(|| Status::not_found("sandbox not found while recording observation"))?;
-    let component_name = match component {
-        ConfigComponent::SandboxConfig => "sandbox_config",
-        ConfigComponent::ProviderEnvironment => "provider_environment",
-        ConfigComponent::Unspecified => "unspecified",
-    };
-    let observation_id = format!("{sandbox_id}:{component_name}");
-    let now_ms = current_time_ms();
-    let sanitized_error = result
-        .failure
-        .as_ref()
-        .map(|failure| failure.message.chars().take(1024).collect())
-        .unwrap_or_default();
-    let observation = StoredConfigComponentObservation {
-        metadata: Some(openshell_core::proto::ObjectMeta {
-            id: observation_id.clone(),
-            name: observation_id,
-            workspace: sandbox.object_workspace().to_string(),
-            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
-            ..Default::default()
-        }),
-        sandbox_id: sandbox.object_id().to_string(),
-        component: component.into(),
-        requested_revision: result.requested_revision.clone(),
-        applied_revision: result.applied_revision.clone(),
-        outcome: outcome.into(),
-        effective_source: match outcome {
-            ConfigApplyOutcome::RetainedLocalOverride => "local_override",
-            ConfigApplyOutcome::FailedRetainedLastKnownGood => "last_known_good",
-            ConfigApplyOutcome::FailedClosed => "fail_closed",
-            ConfigApplyOutcome::Degraded => "gateway_degraded",
-            ConfigApplyOutcome::Unspecified
-            | ConfigApplyOutcome::Applied
-            | ConfigApplyOutcome::IgnoredDuplicate
-            | ConfigApplyOutcome::IgnoredStale
-            | ConfigApplyOutcome::Unsupported
-            | ConfigApplyOutcome::AwaitingComponent => "gateway",
-        }
-        .to_string(),
-        observed_at_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
-        sanitized_error,
-    };
-    state
-        .store
-        .put_scoped_message(&observation, sandbox_id)
-        .await
-        .map_err(|error| Status::internal(format!("persist component observation failed: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -6797,21 +6723,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_apply_result_persists_compact_observed_state() {
-        let state = push_state_with_sandbox("sb-observed").await;
-        let requested_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(11)),
-        };
-        let applied_revision = ConfigSnapshotRevision {
-            component: Some(config_snapshot_revision::Component::ProviderEnvironment(9)),
+    async fn sandbox_config_result_records_the_policy_load_failure() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let state = push_state_with_sandbox("sb-policy-result").await;
+        state
+            .store
+            .put_policy_revision(
+                "policy-3",
+                "sb-policy-result",
+                "default",
+                3,
+                &openshell_core::proto::SandboxPolicy::default().encode_to_vec(),
+                "hash-3",
+            )
+            .await
+            .unwrap();
+        let revision = |config_revision| ConfigSnapshotRevision {
+            component: Some(config_snapshot_revision::Component::SandboxConfig(
+                SandboxConfigRevision {
+                    config_revision,
+                    policy_version: 3,
+                    policy_source: PolicySource::Sandbox.into(),
+                    ..Default::default()
+                },
+            )),
         };
         record_component_apply_result(
             &state,
-            "sb-observed",
+            "sb-policy-result",
             &ConfigComponentApplyResult {
-                component: ConfigComponent::ProviderEnvironment.into(),
-                requested_revision: Some(requested_revision),
-                applied_revision: Some(applied_revision),
+                component: ConfigComponent::SandboxConfig.into(),
+                requested_revision: Some(revision(7)),
+                applied_revision: Some(revision(6)),
                 outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood.into(),
                 failure: Some(openshell_core::proto::ConfigApplyFailure {
                     message: "x".repeat(2_000),
@@ -6822,24 +6766,14 @@ mod tests {
         .await
         .unwrap();
 
-        let observation = state
+        let policy = state
             .store
-            .get_message::<StoredConfigComponentObservation>("sb-observed:provider_environment")
+            .get_policy_by_version("sb-policy-result", 3)
             .await
             .unwrap()
-            .expect("component observation");
-        assert_eq!(observation.sandbox_id, "sb-observed");
-        assert_eq!(
-            observation.component,
-            ConfigComponent::ProviderEnvironment as i32
-        );
-        assert_eq!(
-            observation.outcome,
-            ConfigApplyOutcome::FailedRetainedLastKnownGood as i32
-        );
-        assert_eq!(observation.effective_source, "last_known_good");
-        assert_eq!(observation.sanitized_error.len(), 1_024);
-        assert!(observation.observed_at_time.is_some());
+            .expect("policy revision");
+        assert_eq!(policy.status, "failed");
+        assert_eq!(policy.load_error.map(|error| error.len()), Some(1_024));
     }
 
     #[test]
@@ -7046,17 +6980,6 @@ mod tests {
         )
         .await;
 
-        assert!(
-            state
-                .store
-                .get_message::<StoredConfigComponentObservation>(
-                    "sb-generation-pending-retry:sandbox_config",
-                )
-                .await
-                .unwrap()
-                .is_none(),
-            "a transient cross-component ordering result must not become durable state"
-        );
         let sandbox = state
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -7263,15 +7186,6 @@ mod tests {
         )
         .await;
 
-        let observation = state
-            .store
-            .get_message::<StoredConfigComponentObservation>(
-                "sb-bootstrap-ack:provider_environment",
-            )
-            .await
-            .unwrap()
-            .expect("bootstrap observation");
-        assert_eq!(observation.requested_revision, Some(revision.clone()));
         assert_eq!(
             state.supervisor_sessions.deliver_config(
                 "sb-bootstrap-ack",
