@@ -1609,6 +1609,120 @@ async fn postgres_deleting_sandbox_rejects_operations() {
     assert_deleting_sandbox_rejects_operations(&store).await;
 }
 
+#[tokio::test]
+async fn configuration_transactions_store_only_the_requested_target() {
+    let store = test_store().await;
+    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_configuration_transactions_store_only_the_requested_target() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
+}
+
+// Completion correlates on the dimension an operation changed, so writes keep
+// the requested target instead of stamping the other dimension's revision.
+async fn assert_configuration_transactions_store_only_the_requested_target(store: &Store) {
+    let suffix = uuid::Uuid::new_v4();
+
+    let settings_sandbox = policy_test_sandbox(
+        &format!("target-settings-write-{suffix}"),
+        &format!("target-settings-write-{suffix}"),
+    );
+    store.put_message(&settings_sandbox).await.unwrap();
+    store
+        .put_policy_revision(
+            &format!("target-settings-policy-{suffix}"),
+            settings_sandbox.object_id(),
+            "default",
+            1,
+            &SandboxPolicy::default().encode_to_vec(),
+            "target-settings-policy-hash",
+        )
+        .await
+        .unwrap();
+    let settings_operation = settings_operation_for(&settings_sandbox, 1);
+    put_settings_with_operation(
+        store,
+        &settings_sandbox,
+        &format!("target-settings-record-{suffix}"),
+        &settings_operation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_operation_target(store, &settings_operation).await,
+        (0, 1)
+    );
+
+    let policy_sandbox = policy_test_sandbox(
+        &format!("target-policy-write-{suffix}"),
+        &format!("target-policy-write-{suffix}"),
+    );
+    store.put_message(&policy_sandbox).await.unwrap();
+    put_settings_with_operation(
+        store,
+        &policy_sandbox,
+        &format!("target-policy-settings-record-{suffix}"),
+        &settings_operation_for(&policy_sandbox, 1),
+    )
+    .await
+    .unwrap();
+    let current = store
+        .get_message::<Sandbox>(policy_sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let policy_operation = new_record(&policy_sandbox, OperationTarget::PolicyVersion(1));
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: format!("target-policy-revision-{suffix}"),
+            sandbox_id: policy_sandbox.object_id().to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: SandboxPolicy::default().encode_to_vec(),
+            policy_hash: "target-policy-hash".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: current.metadata.as_ref().unwrap().resource_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+            operation: Some(policy_operation.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_operation_target(store, &policy_operation).await,
+        (1, 0)
+    );
+
+    let unchanged = new_record(&policy_sandbox, OperationTarget::PolicyVersion(1));
+    store
+        .insert_existing_config_operation(&unchanged)
+        .await
+        .unwrap();
+    assert_eq!(stored_operation_target(store, &unchanged).await, (1, 0));
+}
+
+async fn stored_operation_target(
+    store: &Store,
+    operation: &crate::storage_proto::StoredConfigUpdateOperation,
+) -> (u32, u64) {
+    let stored = store
+        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(
+            &operation.operation.as_ref().unwrap().operation_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        stored.target_policy_version,
+        stored.target_settings_revision,
+    )
+}
+
 async fn settings_projection_uses_locked_sandbox_version(
     store: Store,
     requested: StdHashMap<String, String>,
