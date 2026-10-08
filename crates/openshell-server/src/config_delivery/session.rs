@@ -1525,7 +1525,7 @@ mod tests {
             session_id.into(),
             tx.clone(),
             make_shutdown(),
-            SessionMode::ConfigApply(Arc::clone(&slots)),
+            SessionMode::Push(Arc::clone(&slots)),
         );
         (tx, SessionOutbound::new(rx, slots))
     }
@@ -1713,7 +1713,7 @@ mod tests {
             session_id.into(),
             tx,
             make_shutdown(),
-            SessionMode::ConfigApply(Arc::clone(&slots)),
+            SessionMode::Push(Arc::clone(&slots)),
         );
         slots
     }
@@ -2122,7 +2122,7 @@ mod tests {
             "session-1".into(),
             tx.clone(),
             shutdown_tx,
-            SessionMode::ConfigApply(Arc::clone(&slots)),
+            SessionMode::Push(Arc::clone(&slots)),
         );
         let snapshot = SandboxConfigSnapshot {
             configuration_instance_id: "configuration-1".into(),
@@ -2644,7 +2644,7 @@ mod tests {
             "session-1".into(),
             tx.clone(),
             make_shutdown(),
-            SessionMode::ConfigApply(Arc::clone(&slots)),
+            SessionMode::Push(Arc::clone(&slots)),
         );
         (tx, rx, slots)
     }
@@ -3030,6 +3030,32 @@ mod tests {
         })
         .await
         .expect("runtime readiness marks the polling session ready");
+    }
+
+    #[tokio::test]
+    async fn polling_reconnect_after_workload_start_is_ready_on_accept() {
+        let state = state_with_sandbox("sb-poll-running").await;
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream(
+            &state,
+            "sb-poll-running",
+            StreamFeatures::ApplyAfterStart,
+        )
+        .await
+        .expect("apply-capable supervisor reconnects in poll mode");
+
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted");
+        };
+        assert!(!accepted.config_apply_enabled);
+        // Its workload already runs, so it is ready like a supervisor that
+        // predates streamed apply.
+        assert!(
+            state
+                .supervisor_sessions
+                .is_runtime_ready("sb-poll-running")
+        );
     }
 
     #[tokio::test]

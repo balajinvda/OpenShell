@@ -1001,8 +1001,12 @@ pub mod test_support {
     pub enum StreamFeatures {
         /// Predates streamed configuration and keeps polling.
         Legacy,
-        /// Applies and acknowledges streamed configuration.
+        /// Applies and acknowledges streamed configuration, connecting before
+        /// its workload starts.
         Apply,
+        /// Applies streamed configuration and reconnects after its workload
+        /// started.
+        ApplyAfterStart,
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
@@ -1103,7 +1107,8 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_apply: features == StreamFeatures::Apply,
+                    supports_config_apply: features != StreamFeatures::Legacy,
+                    workload_pending: features == StreamFeatures::Apply,
                     connection_epoch,
                     image_policy_discovery,
                     supports_provider_readiness: false,

@@ -592,6 +592,7 @@ pub async fn prepare(
                 sandbox_id.clone(),
                 instance_id.clone(),
                 connection_epoch,
+                true,
                 Some(image_policy_discovery.clone()),
                 prepare_policy.take(),
             )
@@ -842,6 +843,7 @@ async fn run_single_session(
         config.sandbox_id.clone(),
         config.instance_id.clone(),
         connection_epoch,
+        !config.runtime_ready.load(Ordering::Acquire),
         None,
         None,
     )
@@ -902,6 +904,7 @@ async fn open_session(
     sandbox_id: String,
     instance_id: String,
     connection_epoch: u64,
+    workload_pending: bool,
     image_policy_discovery: Option<ImagePolicyDiscovery>,
     mut prepare_policy: Option<StartupPolicyPreparer>,
 ) -> Result<OpenedSession, OpenSessionError> {
@@ -929,6 +932,7 @@ async fn open_session(
             sandbox_id: sandbox_id.clone(),
             instance_id: instance_id.clone(),
             supports_config_apply: true,
+            workload_pending,
             connection_epoch,
             image_policy_discovery,
             supports_provider_readiness: true,

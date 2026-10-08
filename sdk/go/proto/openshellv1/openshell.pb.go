@@ -13813,6 +13813,10 @@ type SupervisorHello struct {
 	// The supervisor understands SessionRedirect. Gateways never redirect a
 	// supervisor that does not set this.
 	SupportsSessionRedirect bool `protobuf:"varint,6,opt,name=supports_session_redirect,json=supportsSessionRedirect,proto3" json:"supports_session_redirect,omitempty"`
+	// Set while the supervisor's workload has not started yet. The gateway then
+	// waits for SupervisorRuntimeReady before treating the sandbox as ready;
+	// otherwise a polling session is ready as soon as it is accepted.
+	WorkloadPending bool `protobuf:"varint,7,opt,name=workload_pending,json=workloadPending,proto3" json:"workload_pending,omitempty"`
 	// Explicit result of inspecting the workload image policy, sent only on the
 	// first connection of a supervisor process. The gateway considers it when
 	// preparing the first authoritative bootstrap for this process.
@@ -13894,6 +13898,13 @@ func (x *SupervisorHello) GetRedirected() bool {
 func (x *SupervisorHello) GetSupportsSessionRedirect() bool {
 	if x != nil {
 		return x.SupportsSessionRedirect
+	}
+	return false
+}
+
+func (x *SupervisorHello) GetWorkloadPending() bool {
+	if x != nil {
+		return x.WorkloadPending
 	}
 	return false
 }
@@ -20436,7 +20447,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rconfig_update\x18\a \x01(\v2\x1a.openshell.v1.ConfigUpdateH\x00R\fconfigUpdate\x12`\n" +
 	"\x18startup_config_candidate\x18\b \x01(\v2$.openshell.v1.StartupConfigCandidateH\x00R\x16startupConfigCandidate\x12f\n" +
 	"\x17configuration_admission\x18\t \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionH\x00R\x16configurationAdmissionB\t\n" +
-	"\apayload\"\xa6\x03\n" +
+	"\apayload\"\xd1\x03\n" +
 	"\x0fSupervisorHello\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -20447,7 +20458,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"redirected\x18\x05 \x01(\bR\n" +
 	"redirected\x12:\n" +
-	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x12X\n" +
+	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x12)\n" +
+	"\x10workload_pending\x18\a \x01(\bR\x0fworkloadPending\x12X\n" +
 	"\x16image_policy_discovery\x18\b \x01(\v2\".openshell.v1.ImagePolicyDiscoveryR\x14imagePolicyDiscovery\x122\n" +
 	"\x15supports_config_apply\x18\t \x01(\bR\x13supportsConfigApply\"\xc7\x01\n" +
 	"\x14ImagePolicyDiscovery\x122\n" +

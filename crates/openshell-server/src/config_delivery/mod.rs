@@ -882,7 +882,7 @@ pub fn register_test_apply_session(
         session_id.to_string(),
         control.clone(),
         tokio::sync::oneshot::channel().0,
-        crate::supervisor_session::SessionMode::ConfigApply(Arc::clone(&slots)),
+        crate::supervisor_session::SessionMode::Push(Arc::clone(&slots)),
     );
     register_session(
         state,

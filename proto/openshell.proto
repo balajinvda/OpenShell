@@ -3088,6 +3088,10 @@ message SupervisorHello {
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
   bool supports_session_redirect = 6;
+  // Set while the supervisor's workload has not started yet. The gateway then
+  // waits for SupervisorRuntimeReady before treating the sandbox as ready;
+  // otherwise a polling session is ready as soon as it is accepted.
+  bool workload_pending = 7;
   // Explicit result of inspecting the workload image policy, sent only on the
   // first connection of a supervisor process. The gateway considers it when
   // preparing the first authoritative bootstrap for this process.

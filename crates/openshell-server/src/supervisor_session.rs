@@ -48,17 +48,16 @@ use crate::supervisor_owner::{
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
-/// How a supervisor session takes part in configuration delivery and readiness.
+/// How a supervisor session receives configuration, and when it is ready.
 #[derive(Clone, Debug)]
 pub(crate) enum SessionMode {
-    /// Predates streamed apply. Ready as soon as the session is accepted.
-    Legacy,
-    /// Can apply streamed configuration but polls on this gateway. Ready after
-    /// `SupervisorRuntimeReady`, since it connects before its workload starts.
-    ReportsReadiness,
+    /// The supervisor polls for configuration. It is ready on accept when its
+    /// workload is already running, as for supervisors that predate streamed
+    /// apply; otherwise after `SupervisorRuntimeReady`.
+    Poll { ready_on_accept: bool },
     /// Applies and acknowledges configuration streamed through these slots.
     /// Ready after `SupervisorRuntimeReady` with an accepted admission.
-    ConfigApply(Arc<ConfigSlots>),
+    Push(Arc<ConfigSlots>),
 }
 
 /// Initial backoff between session-availability polls in `wait_for_session`.
@@ -442,7 +441,15 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        self.register_with_mode(sandbox_id, session_id, tx, shutdown, SessionMode::Legacy)
+        self.register_with_mode(
+            sandbox_id,
+            session_id,
+            tx,
+            shutdown,
+            SessionMode::Poll {
+                ready_on_accept: true,
+            },
+        )
     }
 
     /// Register a session with its configuration delivery and readiness mode.
@@ -457,10 +464,15 @@ impl SupervisorSessionRegistry {
         shutdown: oneshot::Sender<()>,
         mode: SessionMode,
     ) -> bool {
-        let runtime_ready = matches!(mode, SessionMode::Legacy);
+        let runtime_ready = matches!(
+            mode,
+            SessionMode::Poll {
+                ready_on_accept: true
+            }
+        );
         let config = match mode {
-            SessionMode::ConfigApply(slots) => Some(ConfigSessionState::new(slots)),
-            SessionMode::Legacy | SessionMode::ReportsReadiness => None,
+            SessionMode::Push(slots) => Some(ConfigSessionState::new(slots)),
+            SessionMode::Poll { .. } => None,
         };
         let mut sessions = self.sessions.lock().unwrap();
         let previous = sessions.remove(&sandbox_id);
@@ -2198,8 +2210,13 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         mut inbound,
         session_lifetime,
     } = setup;
-    let stream_applies_config = matches!(mode, SessionMode::ConfigApply(_));
-    let legacy = matches!(mode, SessionMode::Legacy);
+    let stream_applies_config = matches!(mode, SessionMode::Push(_));
+    let ready_on_accept = matches!(
+        mode,
+        SessionMode::Poll {
+            ready_on_accept: true
+        }
+    );
     let expected_bootstrap = bootstrap.as_ref().map(ExpectedBootstrap::new);
     let session_id = Uuid::new_v4().to_string();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2315,7 +2332,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     // not durably record the connection. Dropping the buffered response forces
     // a reconnect, which gives the state transition a fresh chance. Other
     // sessions become ready only after SupervisorRuntimeReady.
-    if legacy
+    if ready_on_accept
         && !mark_supervisor_initialized(&state, &sandbox_id, &session_id, &instance_id, false).await
     {
         state
@@ -2478,11 +2495,13 @@ pub async fn handle_connect_supervisor(
     // Reconnects from the same process omit it and proceed directly to the
     // current authoritative bootstrap.
     let mode = if stream_applies_config {
-        SessionMode::ConfigApply(Arc::new(ConfigSlots::default()))
-    } else if hello.supports_config_apply {
-        SessionMode::ReportsReadiness
+        SessionMode::Push(Arc::new(ConfigSlots::default()))
     } else {
-        SessionMode::Legacy
+        // Supervisors that predate streamed apply never set workload_pending:
+        // they connect once their workload runs.
+        SessionMode::Poll {
+            ready_on_accept: !hello.workload_pending,
+        }
     };
     let prepares_startup_policy = stream_applies_config && hello.image_policy_discovery.is_some();
     let image_policy_admission = if stream_applies_config {
@@ -2562,8 +2581,8 @@ pub async fn handle_connect_supervisor(
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>,
     > = match &mode {
-        SessionMode::ConfigApply(slots) => Box::pin(SessionOutbound::new(rx, Arc::clone(slots))),
-        SessionMode::Legacy | SessionMode::ReportsReadiness => {
+        SessionMode::Push(slots) => Box::pin(SessionOutbound::new(rx, Arc::clone(slots))),
+        SessionMode::Poll { .. } => {
             Box::pin(tokio_stream::StreamExt::map(ReceiverStream::new(rx), Ok))
         }
     };

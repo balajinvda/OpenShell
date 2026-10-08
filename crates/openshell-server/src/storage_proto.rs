@@ -137,12 +137,13 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
-    // SessionRedirect and SupervisorHello.redirected are supervisor control
-    // traffic and are never stored.
+    // SessionRedirect, SupervisorHello.redirected, and
+    // SupervisorHello.workload_pending are supervisor control traffic and are
+    // never stored.
     // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
     // stored operations but never recorded on one: it is not terminal.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "ef46c2cf3c8693e4ae64c709776ad6b8a110f0b51fdf346f1757d20868d10a22";
+        "57a2340a0127cf21935f75b874a7dc3a69cf0a00e2a5b0d887cb528c7ea8eac8";
     const DURABLE_SCHEMA_SHA256: &str =
         "175abd05375cf02b72f1c1b5b92bbbe7e20033fdca9e616a14469db178c92f8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

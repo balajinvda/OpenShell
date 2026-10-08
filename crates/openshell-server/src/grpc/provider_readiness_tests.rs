@@ -74,6 +74,7 @@ fn hello() -> SupervisorHello {
         supports_provider_readiness: true,
         image_policy_discovery: None,
         supports_config_apply: false,
+        workload_pending: false,
         redirected: false,
         supports_session_redirect: true,
     }
