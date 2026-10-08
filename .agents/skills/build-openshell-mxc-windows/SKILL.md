@@ -335,6 +335,16 @@ in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 ## Unsupported Driver Contract
 
+MXC requests and mapper artifacts use the stable 1.0.0 schema. Upgrade the
+native host executor to the signed MXC 1.0.0 release before running E2E; preserve
+the old executable for rollback and verify the release checksum, architecture,
+signature, and `--probe` output. Remove `default_configuration_id` from gateway
+configurations: it is retired and rejected. Do not restore alpha-version or
+wildcard compatibility knobs. Standalone network mapping emits numeric CIDRs
+and TCP ports and reports unrepresentable DNS/L7 semantics as losses; full
+network governance remains in the host supervisor. IsolationSession remains
+unsupported by this runtime pair, and its filesystem grants are not enforceable.
+
 MXC does not support external-resource label admission. Its factory explicitly
 acknowledges admission as disabled; do not add `resource_admission` to MXC TOML
 or weaken admission defaults for other drivers. Caller driver JSON still
