@@ -618,7 +618,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
             sandbox_row(&mut tx, sandbox_projection.sandbox_id).await?;
         let (mut sandbox, changed) = sandbox_projection.apply(&sandbox_payload, current_version)?;
         if operation.is_some() {
-            ensure_sandbox_accepts_operations(&sandbox, current_version)?;
+            ensure_sandbox_accepts_operations(&sandbox)?;
         }
         match condition {
             WriteCondition::MustCreate => {
@@ -698,10 +698,10 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
             .await
             .map_err(|e| map_db_error(&e))?;
         let (sandbox_payload, current_version) = sandbox_row(&mut tx, operation.sandbox_id).await?;
-        ensure_sandbox_accepts_operations(
-            &decode_sandbox_payload(&sandbox_payload, current_version)?,
+        ensure_sandbox_accepts_operations(&decode_sandbox_payload(
+            &sandbox_payload,
             current_version,
-        )?;
+        )?)?;
         insert_config_operation(&mut tx, &operation, current_time_ms()).await?;
         tx.commit().await.map_err(|e| map_db_error(&e))
     }
@@ -1611,7 +1611,7 @@ ON CONFLICT DO NOTHING
             .map(ConfigOperationRow::new)
             .transpose()?;
         if operation.is_some() {
-            ensure_sandbox_accepts_operations(&sandbox, current_version)?;
+            ensure_sandbox_accepts_operations(&sandbox)?;
         }
 
         let resulting_version = if sandbox_changed {

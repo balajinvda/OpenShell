@@ -1538,7 +1538,7 @@ async fn assert_deleting_sandbox_rejects_operations(store: &Store) {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, PersistenceError::Conflict { .. }),
+        matches!(error, PersistenceError::SandboxDeleting),
         "{error}"
     );
     let error = put_settings_with_operation(
@@ -1550,7 +1550,7 @@ async fn assert_deleting_sandbox_rejects_operations(store: &Store) {
     .await
     .unwrap_err();
     assert!(
-        matches!(error, PersistenceError::Conflict { .. }),
+        matches!(error, PersistenceError::SandboxDeleting),
         "{error}"
     );
     let error = store
@@ -1570,7 +1570,7 @@ async fn assert_deleting_sandbox_rejects_operations(store: &Store) {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, PersistenceError::Conflict { .. }),
+        matches!(error, PersistenceError::SandboxDeleting),
         "{error}"
     );
 

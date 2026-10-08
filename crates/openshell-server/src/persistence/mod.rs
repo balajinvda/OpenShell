@@ -91,16 +91,13 @@ fn decode_sandbox_payload(
 /// removed with the sandbox, or observes the phase here and is rejected.
 fn ensure_sandbox_accepts_operations(
     sandbox: &openshell_core::proto::Sandbox,
-    current_resource_version: u64,
 ) -> PersistenceResult<()> {
     let deleting = sandbox
         .status
         .as_ref()
         .is_some_and(|status| status.phase == openshell_core::proto::SandboxPhase::Deleting as i32);
     if deleting {
-        return Err(PersistenceError::Conflict {
-            current_resource_version: Some(current_resource_version),
-        });
+        return Err(PersistenceError::SandboxDeleting);
     }
     Ok(())
 }
@@ -185,6 +182,8 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    #[error("sandbox is being deleted")]
+    SandboxDeleting,
 }
 
 impl PersistenceError {

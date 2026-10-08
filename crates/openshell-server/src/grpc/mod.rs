@@ -99,6 +99,9 @@ pub fn persistence_error_to_status(
             ),
             current_resource_version,
         ),
+        PersistenceError::SandboxDeleting => {
+            Status::failed_precondition(format!("{operation} failed: sandbox is being deleted"))
+        }
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
