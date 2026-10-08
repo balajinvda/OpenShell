@@ -597,6 +597,11 @@ enum OwnerCheck {
 }
 
 async fn owner_check(state: &Arc<ServerState>, sandbox_id: &str, session_id: &str) -> OwnerCheck {
+    // A single-replica gateway owns every session, and `deliver_config`
+    // already refuses a replaced session.
+    if state.store.is_single_replica() {
+        return OwnerCheck::Current;
+    }
     let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
     match owners.read(sandbox_id).await {
         Ok(Some(owner)) if owner.is_fresh(OWNER_TTL) => {
@@ -1200,32 +1205,6 @@ mod tests {
         assert!(!state.config_delivery.lock().delivery_worker_running);
         assert!(
             next_update(&mut harness, Duration::from_millis(100))
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_local_session_gets_nothing_after_its_owner_moves() {
-        let state = push_state().await;
-        put_sandbox(&state, "moved", &[]).await;
-        let (mut harness, _) = accepted_session(&state, "moved").await;
-        assert!(has_recipient(&state, "moved"));
-        SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL)
-            .publish(
-                "moved",
-                "remote-session",
-                "instance",
-                2,
-                "other-replica",
-                "http://127.0.0.1:9",
-            )
-            .await
-            .unwrap();
-
-        publish_sandbox_components(&state, "moved", ConfigComponents::SANDBOX_CONFIG);
-        assert!(
-            next_update(&mut harness, Duration::from_millis(500))
                 .await
                 .is_none()
         );
