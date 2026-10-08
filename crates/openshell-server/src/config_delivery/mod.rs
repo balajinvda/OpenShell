@@ -670,10 +670,10 @@ async fn notify_sandbox_owner(
                 PeerNotifyResult::Done
             };
         }
-        if !is_peer_endpoint(&owner.owner_peer_endpoint) {
+        let Some(peer_endpoint) = owner.peer_endpoint().map(ToString::to_string) else {
             warn!(sandbox_id, owner = %owner.owner_replica_id, "configuration owner has no reachable peer endpoint");
             return PeerNotifyResult::Done;
-        }
+        };
         let request = PeerNotifyConfigUpdateRequest {
             scope: Some(peer_notify_config_update_request::Scope::Sandbox(
                 PeerConfigSandboxTarget {
@@ -684,7 +684,7 @@ async fn notify_sandbox_owner(
             sandbox_config: components.sandbox_config,
             provider_environment: components.provider_environment,
         };
-        match send_peer_notify(state, &owner.owner_peer_endpoint, request).await {
+        match send_peer_notify(state, &peer_endpoint, request).await {
             PeerNotifyOutcome::StaleOwner => final_outcome = "stale_owner",
             PeerNotifyOutcome::Failed(outcome) => {
                 final_outcome = outcome;
@@ -741,10 +741,6 @@ fn peer_scope(scope: &FanoutScope) -> peer_notify_config_update_request::Scope {
             })
         }
     }
-}
-
-fn is_peer_endpoint(endpoint: &str) -> bool {
-    endpoint.starts_with("http://") || endpoint.starts_with("https://")
 }
 
 enum PeerNotifyOutcome {

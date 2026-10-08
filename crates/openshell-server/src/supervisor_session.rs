@@ -86,9 +86,6 @@ const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
 const PEER_TLS_SERVER_NAME_ENV: &str = "OPENSHELL_PEER_TLS_SERVER_NAME";
 /// How long a resolved owner record is reused before rereading the store.
 /// Well below `OWNER_TTL` so a cache hit can never outlive the record itself.
-/// Marks an owner record written by a gateway that advertises no peer endpoint.
-/// Only that gateway can serve such a session, so no peer should dial it.
-const LOCAL_OWNER_ENDPOINT_SCHEME: &str = "local://";
 const OWNER_CACHE_TTL: Duration = Duration::from_secs(3);
 /// How often the owner cache reclaims expired entries. Rate-limited so an
 /// insert never scans the whole map.
@@ -1515,7 +1512,7 @@ pub(crate) async fn remote_supervisor_owner(
     if owner.owner_replica_id == state.replica_id {
         return Ok(None);
     }
-    if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+    if owner.peer_endpoint().is_none() {
         return Err(Status::failed_precondition(format!(
             "sandbox is owned by gateway replica {} which advertises no peer endpoint",
             owner.owner_replica_id
@@ -1724,7 +1721,7 @@ pub async fn open_routed_relay_with_message(
                     backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
                     continue;
                 }
-                if owner_endpoint_is_local_only(&owner.owner_peer_endpoint) {
+                if owner.peer_endpoint().is_none() {
                     return Err(Status::failed_precondition(format!(
                         "sandbox is owned by gateway replica {} which advertises no peer endpoint; \
                          set OPENSHELL_PEER_ENDPOINT on every replica to route across replicas",
@@ -1823,12 +1820,10 @@ fn owner_hint(
 
 /// Endpoint recorded when this replica advertises none.
 fn local_owner_endpoint(replica_id: &str) -> String {
-    format!("{LOCAL_OWNER_ENDPOINT_SCHEME}{replica_id}")
-}
-
-/// True when an owner record names a gateway that no peer can dial.
-fn owner_endpoint_is_local_only(endpoint: &str) -> bool {
-    endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)
+    format!(
+        "{}{replica_id}",
+        crate::supervisor_owner::LOCAL_OWNER_ENDPOINT_SCHEME
+    )
 }
 
 /// Where the ring says this sandbox belongs, when that is not this replica.
@@ -1880,11 +1875,7 @@ fn ring_redirect(
         return None;
     }
     let peer_endpoint = preferred_peer_endpoint?;
-    // `local://` endpoints are placeholders used when no peer endpoint is
-    // configured, so they are not dialable from another replica.
-    if peer_endpoint.is_empty() || owner_endpoint_is_local_only(&peer_endpoint) {
-        return None;
-    }
+    crate::supervisor_owner::dialable_peer_endpoint(&peer_endpoint)?;
 
     Some(SessionRedirect {
         peer_endpoint,
@@ -4421,13 +4412,21 @@ mod tests {
     fn a_gateway_without_a_peer_endpoint_still_records_ownership() {
         let endpoint = local_owner_endpoint("gw-0");
         assert_eq!(endpoint, "local://gw-0");
-        assert!(owner_endpoint_is_local_only(&endpoint));
+        assert!(crate::supervisor_owner::dialable_peer_endpoint(&endpoint).is_none());
     }
 
     #[test]
-    fn a_dialable_owner_endpoint_is_not_local_only() {
-        assert!(!owner_endpoint_is_local_only("https://10.0.0.1:8080"));
-        assert!(!owner_endpoint_is_local_only("http://10.0.0.1:8080"));
+    fn only_advertised_peer_endpoints_are_dialable() {
+        use crate::supervisor_owner::dialable_peer_endpoint;
+        assert!(dialable_peer_endpoint("").is_none());
+        assert_eq!(
+            dialable_peer_endpoint("https://10.0.0.1:8080"),
+            Some("https://10.0.0.1:8080")
+        );
+        assert_eq!(
+            dialable_peer_endpoint("http://10.0.0.1:8080"),
+            Some("http://10.0.0.1:8080")
+        );
     }
 
     #[test]

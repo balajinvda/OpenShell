@@ -51,6 +51,16 @@ struct OwnerPayload {
     connected_at_ms: i64,
 }
 
+/// Marks an owner record written by a gateway that advertises no peer endpoint.
+/// Only that gateway can serve such a session, so no peer should dial it.
+pub const LOCAL_OWNER_ENDPOINT_SCHEME: &str = "local://";
+
+/// `endpoint`, unless it is empty or a `local://` placeholder that no other
+/// replica can dial.
+pub fn dialable_peer_endpoint(endpoint: &str) -> Option<&str> {
+    (!endpoint.is_empty() && !endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)).then_some(endpoint)
+}
+
 #[derive(Debug, Clone)]
 pub struct OwnerRecord {
     pub session_id: String,
@@ -69,6 +79,11 @@ impl OwnerRecord {
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
         now_ms().saturating_sub(self.updated_at_ms).max(0) < ttl_ms
+    }
+
+    /// The endpoint other replicas dial to reach this owner, if it has one.
+    pub fn peer_endpoint(&self) -> Option<&str> {
+        dialable_peer_endpoint(&self.owner_peer_endpoint)
     }
 }
 
@@ -249,11 +264,11 @@ impl SupervisorOwnerIndex {
                 match decode_owner_record(record) {
                     Ok((_, owner))
                         if owner.is_fresh(self.ttl)
-                            && owner.owner_replica_id != local_replica_id
-                            && (owner.owner_peer_endpoint.starts_with("http://")
-                                || owner.owner_peer_endpoint.starts_with("https://")) =>
+                            && owner.owner_replica_id != local_replica_id =>
                     {
-                        endpoints.insert(owner.owner_peer_endpoint);
+                        if let Some(endpoint) = owner.peer_endpoint() {
+                            endpoints.insert(endpoint.to_string());
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
