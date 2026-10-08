@@ -457,10 +457,11 @@ export interface SetPolicyOptions extends SandboxWorkspaceOptions {
   /**
    * Ask the gateway to wait for a durable terminal apply result. Gateways that
    * do not track completion, such as those that keep configuration polling,
-   * return the committed result without an operation.
+   * return the committed result without an operation; the client then polls
+   * getConfig until the applied policy hash is observed.
    */
   wait?: boolean;
-  /** Bound the server-side wait in seconds. Default 60. */
+  /** Bound the server-side wait, or the client-side poll fallback, in seconds. Default 60. */
   waitTimeoutSecs?: number;
 }
 
@@ -1758,7 +1759,9 @@ export class SandboxClient {
   // Update the sandbox-scoped policy. Sandbox scope (global=false) may only
   // change network_policies; static fields must match the create-time policy or
   // the gateway rejects the update. With `wait`, the gateway owns the durable
-  // wait and returns only after a terminal apply result.
+  // wait and returns only after a terminal apply result. A gateway that returns
+  // no operation does not track completion; poll getConfig for the applied
+  // policy hash instead.
   async setPolicy(
     name: string,
     policy: MessageInitShape<typeof SandboxPolicySchema>,
@@ -1774,7 +1777,9 @@ export class SandboxClient {
         waitTimeout: durationFromMs(Math.max(0, (options?.waitTimeoutSecs ?? 60) * 1000)),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait && resp.operation) {
+      if (options?.wait && !resp.operation) {
+        await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs, options.workspace);
+      } else if (options?.wait && resp.operation) {
         if (
           resp.operation.state === ConfigUpdateOperationState.FAILED ||
           resp.operation.state === ConfigUpdateOperationState.SUPERSEDED ||
@@ -1813,6 +1818,37 @@ export class SandboxClient {
       return updateConfigResult(resp);
     } catch (e) {
       throw fromConnect(e);
+    }
+  }
+
+  // Poll getConfig until the applied policy hash is observed. Each poll RPC is
+  // bounded by the remaining deadline (deadlineOptions), so a stalled getConfig
+  // cannot make the returned promise outlive timeoutSecs.
+  private async waitForPolicyHash(
+    name: string,
+    policyHash: string,
+    timeoutSecs = 60,
+    workspace?: string,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutSecs * 1000;
+    let delay = 100;
+    for (;;) {
+      let config: SandboxConfig;
+      const pollOptions = deadlineOptions(deadline - Date.now());
+      try {
+        config = await this.getConfig(name, { ...pollOptions, workspace });
+      } catch (e) {
+        if (pollOptions.signal?.aborted || Date.now() >= deadline) {
+          throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
+        }
+        throw e instanceof SdkError ? e : fromConnect(e);
+      }
+      if (config.policyHash === policyHash) return;
+      if (Date.now() >= deadline) {
+        throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
+      }
+      await waitSleep(delay, deadline);
+      delay = Math.min(delay * 2, 2000);
     }
   }
 }
