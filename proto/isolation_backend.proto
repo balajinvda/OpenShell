@@ -10,13 +10,12 @@ import "options.proto";
 
 // Isolation Backend control contract. The supervisor uses this service on a
 // trusted, authenticated endpoint selected by operator configuration or compute
-// driver provisioning. Workload control,
-// network mediation, and byte streams remain on the Sandbox Protocol.
-// PeerMetadata negotiates the base, boundary-routing, and suspend/resume
-// capabilities independently; suspend/resume is optional for a backend.
-// Version 1.0 requires openshell.isolation.contract and
-// openshell.isolation.boundary-routing on both peers. Optional retained-state
-// support advertises openshell.isolation.suspend-resume. Add optional capabilities
+// driver provisioning. Workload control, network mediation, and byte streams
+// remain on the Sandbox Protocol.
+// PeerMetadata negotiates the base contract and optional suspend/resume support.
+// Version 1.0 requires openshell.isolation.contract on both peers and includes
+// boundary routing. Optional state retention support advertises
+// openshell.isolation.suspend-resume. Add optional capabilities
 // with compatible minor versions; incompatible semantics require a major bump.
 service IsolationBackend {
   // Negotiate the isolation contract before opening a boundary. This call
@@ -28,8 +27,9 @@ service IsolationBackend {
   // not run untrusted workload code. The subsequent Sandbox Protocol attach,
   // confirm, and start sequence remains mandatory. A resource that already is
   // the boundary may only validate and reserve its binding, then return a handle.
-  // Retries with the same request_id and launch inputs return the same result;
-  // changed inputs fail. A route opened before attach never authorizes execution.
+  // Reopening the same session and generation returns the same result. The
+  // descriptor must bind to the same provisioned resource; a different resource
+  // binding fails. A route opened before attach never authorizes execution.
   // Driver deletion invalidates all handles and retained-state references,
   // including abandoned launches and suspended boundaries.
   rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
@@ -58,6 +58,9 @@ message GetIsolationCapabilitiesResponse {
 }
 
 message OpenBoundaryRequest {
+  reserved 6;
+  reserved "request_id";
+
   // Stable gateway-assigned sandbox identity, not a public resource name.
   string sandbox_id = 1;
   // Fresh for each launch and unchanged for retries of that launch.
@@ -69,8 +72,6 @@ message OpenBoundaryRequest {
   // Opaque descriptor from the trusted compute driver. The backend validates
   // its resource binding; workload-controlled input must not select it.
   bytes driver_descriptor = 5 [(openshell.options.v1.secret) = true];
-  // Stable idempotency key for this launch transition.
-  string request_id = 6;
 }
 
 message OpenBoundaryResponse {
@@ -92,11 +93,14 @@ message OpenBoundaryResponse {
 }
 
 message SuspendBoundaryRequest {
+  reserved 4;
+  reserved "request_id";
+
+  // Retries for this session and generation return the same reference or a
+  // terminal error.
   string boundary_id = 1;
   string session_id = 2;
   string generation_id = 3;
-  // Replays of this request return the same reference or a terminal error.
-  string request_id = 4;
 }
 
 message SuspendBoundaryResponse {

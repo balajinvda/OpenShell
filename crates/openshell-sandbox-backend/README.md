@@ -8,12 +8,13 @@ control protocol shared with `openshell-sandbox`.
 The supervisor uses the generated `IsolationBackend` control service to
 negotiate capabilities and open a boundary before reading image policy. Each
 physical connection repeats that handshake, including credential-epoch changes
-and transport recovery. The launch session ID is the stable opening request ID;
-retries preserve the descriptor and return the same handle for the runtime's
-lifetime. Driver deletion terminates the runtime and invalidates that handle.
+and transport recovery. The launch session and generation identify retries;
+the descriptor must bind to the same provisioned resource. Reopening returns
+the same handle for the runtime's lifetime. Driver deletion terminates the
+runtime and invalidates that handle.
 
-Protocol 1.0 requires `openshell.isolation.contract` and
-`openshell.isolation.boundary-routing` on both peers. The shared extension
+Isolation protocol 1.0 includes boundary routing and requires
+`openshell.isolation.contract` on both peers. The shared extension
 negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.isolation.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.
@@ -29,9 +30,8 @@ supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing
 connection registry continues to govern supervisor replacement and recovery.
 
-The legacy `IsolationBoundary` schema remains available to generated clients,
-but current runtimes do not serve it. Update the supervisor and sandbox runtime
-together; an older peer fails during startup instead of using a fallback path.
+Update the supervisor and sandbox runtime together; an older peer fails during
+startup instead of using a fallback path.
 
 ## Exec recovery
 

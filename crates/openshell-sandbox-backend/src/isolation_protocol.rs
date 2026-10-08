@@ -3,7 +3,7 @@
 
 //! Negotiated control contract and boundary routing for the Sandbox Protocol.
 
-use openshell_core::extension_protocol::{PROTOCOL_MAJOR, PROTOCOL_MINOR, negotiate_metadata};
+use openshell_core::extension_protocol::negotiate_metadata;
 use openshell_core::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 
 use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
@@ -11,21 +11,14 @@ use crate::isolation_proto::OpenBoundaryRequest;
 use crate::proto::{DelegatedBoundaryChunk, delegated_boundary_chunk::Payload};
 
 pub const CONTRACT_CAPABILITY: &str = "openshell.isolation.contract";
-pub const BOUNDARY_ROUTING_CAPABILITY: &str = "openshell.isolation.boundary-routing";
-pub const SUSPEND_RESUME_CAPABILITY: &str = "openshell.isolation.suspend-resume";
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 
 /// The built-in runtime supports fresh launches; suspend/resume is optional.
 #[must_use]
 pub fn metadata(implementation: &str) -> PeerMetadata {
-    let capabilities = vec![
-        CONTRACT_CAPABILITY.to_string(),
-        BOUNDARY_ROUTING_CAPABILITY.to_string(),
-    ];
+    let capabilities = vec![CONTRACT_CAPABILITY.to_string()];
     PeerMetadata {
-        protocol_version: Some(ProtocolVersion {
-            major: PROTOCOL_MAJOR,
-            minor: PROTOCOL_MINOR,
-        }),
+        protocol_version: Some(PROTOCOL_VERSION),
         implementation_name: implementation.to_string(),
         implementation_version: openshell_core::VERSION.to_string(),
         supported_capabilities: capabilities.clone(),
@@ -53,11 +46,6 @@ pub fn validate_open(
     {
         return Err(tonic::Status::permission_denied(
             "boundary launch identity does not match runtime",
-        ));
-    }
-    if request.request_id.is_empty() || request.request_id.len() > 128 {
-        return Err(tonic::Status::invalid_argument(
-            "boundary request ID is required and must be at most 128 bytes",
         ));
     }
     let descriptor: SandboxRuntimeDescriptor =

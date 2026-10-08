@@ -861,18 +861,6 @@ mod linux {
                 &request,
                 &self.runtime.config,
             )?;
-            {
-                let mut opened = lock(&self.runtime.open_request);
-                match opened.as_ref() {
-                    Some(previous) if *previous != request => {
-                        return Err(tonic::Status::failed_precondition(
-                            "boundary launch retry changed its request ID or descriptor",
-                        ));
-                    }
-                    Some(_) => {}
-                    None => *opened = Some(request),
-                }
-            }
             self.connection_expiry
                 .update(principal.session().expires_at);
             self.opened.store(true, Ordering::Release);
@@ -1505,7 +1493,6 @@ mod linux {
     struct BoundaryRuntime {
         config: BoundaryConfig,
         routing_handle: String,
-        open_request: Mutex<Option<OpenBoundaryRequest>>,
         authenticator: SandboxProtocolAuthenticator,
         connections: SandboxConnectionRegistry,
         connection_shutdowns:
@@ -1791,7 +1778,6 @@ mod linux {
                 ),
                 connection_shutdowns: Mutex::new(std::collections::HashMap::new()),
                 routing_handle: uuid::Uuid::new_v4().to_string(),
-                open_request: Mutex::new(None),
                 config,
                 process_runtime,
                 state: Mutex::new(RuntimeState::AwaitingAttach),
@@ -4138,7 +4124,6 @@ mod linux {
                 generation_id: config.generation.clone(),
                 backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
                 driver_descriptor: serde_json::to_vec(&descriptor).unwrap(),
-                request_id: config.session_id.to_string(),
             }
         }
 
@@ -5310,10 +5295,16 @@ mod linux {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                serve_grpc(Box::new(stream), server_runtime, SandboxConnectionId::new())
-                    .await
-                    .unwrap();
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let runtime = server_runtime.clone();
+                    connections.spawn(async move {
+                        serve_grpc(Box::new(stream), runtime, SandboxConnectionId::new())
+                            .await
+                            .unwrap();
+                    });
+                }
             });
             let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
                 .unwrap()
@@ -5402,17 +5393,54 @@ mod linux {
                     tonic::Code::PermissionDenied
                 );
             }
-            assert!(lock(&runtime.open_request).is_none());
             let handle = test_open_boundary(channel.clone(), opening.clone(), &token).await;
-            let mut changed_retry = opening;
-            changed_retry.request_id = "another-transition".to_string();
+            // JSON formatting does not change the provisioned resource binding.
+            let mut retry = opening.clone();
+            let descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+                serde_json::from_slice(&retry.driver_descriptor).unwrap();
+            retry.driver_descriptor = serde_json::to_vec_pretty(&descriptor).unwrap();
             assert_eq!(
                 control
-                    .open_boundary(bearer_request(changed_retry, &token))
+                    .open_boundary(bearer_request(retry, &token))
                     .await
-                    .unwrap_err()
+                    .unwrap()
+                    .into_inner()
+                    .boundary_id,
+                handle
+            );
+            // Knowing a previous handle does not open a new physical connection.
+            let replacement = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let binding = openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle);
+            let mut replacement_streams =
+                DelegatedIsolationBoundaryClient::new(replacement.clone());
+            assert_eq!(
+                replacement_streams
+                    .exchange(bearer_request(
+                        tokio_stream::iter([binding.clone()]),
+                        &token
+                    ))
+                    .await
+                    .err()
+                    .unwrap()
                     .code(),
                 tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                replacement_streams
+                    .mediate(bearer_request(tokio_stream::iter([binding]), &token))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                test_open_boundary(replacement, opening, &token).await,
+                handle
             );
             assert_eq!(
                 control
@@ -5485,9 +5513,6 @@ mod linux {
                 RuntimeState::AwaitingAttach
             ));
             assert!(lock(&runtime.started_agent).is_none());
-            let legacy = openshell_sandbox_backend::proto::isolation_boundary_client::IsolationBoundaryClient::new(channel)
-                .exchange(bearer_request(tokio_stream::empty::<openshell_sandbox_backend::proto::BoundaryChunk>(), &token)).await;
-            assert_eq!(legacy.err().unwrap().code(), tonic::Code::Unimplemented);
             server.abort();
         }
 

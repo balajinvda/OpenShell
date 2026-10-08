@@ -5,21 +5,6 @@ syntax = "proto3";
 
 package openshell.sandbox.protocol.v1;
 
-// Legacy IsolationBoundary multiplexes the OpenShell Sandbox Protocol
-// over one authenticated gRPC connection. Each Exchange call is an independent
-// HTTP/2 stream; Mediate is the persistent DNS exchange channel. Retained for
-// schema compatibility; current runtimes serve DelegatedIsolationBoundary.
-service IsolationBoundary {
-  rpc Exchange(stream BoundaryChunk) returns (stream BoundaryChunk);
-  rpc Mediate(stream BoundaryChunk) returns (stream BoundaryChunk);
-}
-
-// BoundaryChunk carries an ordered fragment of the existing versioned
-// isolation protocol. Message boundaries are not semantically significant.
-message BoundaryChunk {
-  bytes data = 1;
-}
-
 // Stream entrypoint for per-boundary or shared out-of-process Isolation Backends.
 // Each client stream starts with a boundary_id frame. The backend checks that
 // handle against the authenticated sandbox and generation before accepting any

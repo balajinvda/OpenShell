@@ -1969,8 +1969,6 @@ impl BoundaryClient {
             driver_descriptor: serde_json::to_vec(descriptor).map_err(|_| {
                 BackendError::Descriptor("encode OpenShell runtime descriptor".to_string())
             })?,
-            // Discovery, attachment, and transport recovery all retry the same launch.
-            request_id: descriptor.session_id.to_string(),
         });
         request
             .metadata_mut()
@@ -2373,7 +2371,7 @@ mod tests {
             let request = request.into_inner();
             assert_eq!(request.backend_name, crate::BACKEND_NAME);
             assert!(!request.driver_descriptor.is_empty());
-            assert_eq!(request.request_id, request.session_id);
+            assert!(!request.session_id.is_empty());
             self.opens.fetch_add(1, Ordering::AcqRel);
             Ok(tonic::Response::new(OpenBoundaryResponse {
                 boundary_id: TEST_BOUNDARY_HANDLE.to_string(),
@@ -2407,10 +2405,10 @@ mod tests {
     async fn incompatible_isolation_contract_never_opens_a_boundary() {
         let mut wrong_major = crate::isolation_protocol::metadata("test/backend");
         wrong_major.protocol_version.as_mut().unwrap().major += 1;
-        let mut missing_routing = crate::isolation_protocol::metadata("test/backend");
-        missing_routing.supported_capabilities.retain(|capability| {
-            capability != crate::isolation_protocol::BOUNDARY_ROUTING_CAPABILITY
-        });
+        let mut missing_contract = crate::isolation_protocol::metadata("test/backend");
+        missing_contract
+            .supported_capabilities
+            .retain(|capability| capability != crate::isolation_protocol::CONTRACT_CAPABILITY);
         let mut unsupported_requirement = crate::isolation_protocol::metadata("test/backend");
         unsupported_requirement
             .required_capabilities
@@ -2418,7 +2416,7 @@ mod tests {
         for metadata in [
             None,
             Some(wrong_major),
-            Some(missing_routing),
+            Some(missing_contract),
             Some(unsupported_requirement),
         ] {
             let certificate = test_certificate();
