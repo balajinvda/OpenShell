@@ -24,9 +24,6 @@ import {
   STATUS_NAMES,
 } from './client.js';
 import {
-  ConfigApplyOutcome,
-  ConfigUpdateOperationState,
-  ConfigUpdateWaitMode,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
   SandboxPhase,
@@ -1543,15 +1540,15 @@ describe('config / policy', () => {
     });
   });
 
-  it('setPolicy preserves a degraded outcome after waiting for completion', async () => {
+  it('setPolicy sends global=false + version pin and (wait) polls until the hash matches', async () => {
     let updateReq: {
       sandbox?: string;
       workspace?: string;
       global?: boolean;
       expectedResourceVersion?: bigint;
       policy?: unknown;
-      waitMode?: ConfigUpdateWaitMode;
     } = {};
+    let configCalls = 0;
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id'),
       updateConfig: (req) => {
@@ -1561,50 +1558,8 @@ describe('config / policy', () => {
           policyHash: 'target',
           settingsRevision: 10n,
           deleted: false,
-          operation: {
-            operationId: 'operation-1',
-            state: ConfigUpdateOperationState.APPLIED,
-            outcome: ConfigApplyOutcome.DEGRADED,
-            sanitizedError: 'optional component unavailable',
-          },
         };
       },
-    });
-
-    const result = await sandbox.setPolicy(
-      'sb',
-      {
-        version: 1,
-        networkPolicies: { web: { name: 'web', endpoints: [], binaries: [] } },
-      },
-      { wait: true, expectedResourceVersion: '7' },
-    );
-    expect(requestSandbox(updateReq)).toBe('sb');
-    expect(updateReq.global).toBe(false);
-    expect(updateReq.expectedResourceVersion).toBe(7n);
-    expect(updateReq.policy).toBeDefined();
-    expect(updateReq.waitMode).toBe(ConfigUpdateWaitMode.WAIT_FOR_COMPLETION);
-    expect(result.version).toBe(5);
-    expect(result.policyHash).toBe('target');
-    expect(result.settingsRevision).toBe('10');
-    expect(result.operationId).toBe('operation-1');
-    expect(result.operationState).toBe('applied');
-    expect(result.operationOutcome).toBe('degraded');
-    expect(result.operationError).toBe('optional component unavailable');
-  });
-
-  // A gateway that keeps configuration polling, or predates durable completion,
-  // returns no operation. The client then polls getConfig for the hash.
-  it('setPolicy (wait) polls until the hash matches when completion is not tracked', async () => {
-    let configCalls = 0;
-    const sandbox = client({
-      getSandbox: () => readySandbox('sb', 'sb-id'),
-      updateConfig: () => ({
-        version: 5,
-        policyHash: 'target',
-        settingsRevision: 10n,
-        deleted: false,
-      }),
       getSandboxConfig: () => {
         configCalls += 1;
         const policyHash = configCalls >= 2 ? 'target' : 'stale';
@@ -1621,15 +1576,27 @@ describe('config / policy', () => {
       },
     });
 
-    const result = await sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true });
+    const result = await sandbox.setPolicy(
+      'sb',
+      {
+        version: 1,
+        networkPolicies: { web: { name: 'web', endpoints: [], binaries: [] } },
+      },
+      { wait: true, expectedResourceVersion: '7' },
+    );
+    expect(requestSandbox(updateReq)).toBe('sb');
+    expect(updateReq.global).toBe(false);
+    expect(updateReq.expectedResourceVersion).toBe(7n);
+    expect(updateReq.policy).toBeDefined();
     expect(result.version).toBe(5);
-    expect(result.operationId).toBeUndefined();
+    expect(result.policyHash).toBe('target');
+    expect(result.settingsRevision).toBe('10');
     expect(configCalls).toBeGreaterThanOrEqual(2);
   });
 
-  // setPolicy(..., {wait:true}) must not hang forever when the getConfig poll
-  // stalls. Each poll RPC is bounded by the remaining deadline, so a
-  // getSandboxConfig that never settles on its own is aborted and the wait
+  // Fix #4 residual: setPolicy(..., {wait:true}) must not hang forever when the
+  // getConfig poll stalls. Each poll RPC is bounded by the remaining deadline,
+  // so a getSandboxConfig that never settles on its own is aborted and the wait
   // rejects instead of pending forever. The handler resolves only on the call
   // signal firing, proving the per-poll deadline (not the sleep loop) is what
   // bounds the returned promise.
@@ -1647,43 +1614,6 @@ describe('config / policy', () => {
       sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true, waitTimeoutSecs: 0.2 }),
     ).rejects.toMatchObject({ code: 'connect' });
   }, 5000);
-
-  it('setPolicy without wait does not poll when completion is not tracked', async () => {
-    let configCalls = 0;
-    const sandbox = client({
-      getSandbox: () => readySandbox('sb', 'sb-id'),
-      updateConfig: () => ({ version: 5, policyHash: 'target', settingsRevision: 10n, deleted: false }),
-      getSandboxConfig: () => {
-        configCalls += 1;
-        throw new Error('unexpected getConfig');
-      },
-    });
-
-    const result = await sandbox.setPolicy('sb', { version: 1, networkPolicies: {} });
-    expect(result.version).toBe(5);
-    expect(configCalls).toBe(0);
-  });
-
-  it('setPolicy rejects a terminal failed durable operation', async () => {
-    const sandbox = client({
-      getSandbox: () => readySandbox('sb', 'sb-id'),
-      updateConfig: () => ({
-        version: 5,
-        policyHash: 'target',
-        settingsRevision: 10n,
-        deleted: false,
-        operation: {
-          operationId: 'operation-2',
-          state: ConfigUpdateOperationState.FAILED,
-          sanitizedError: 'runtime rejected policy',
-        },
-      }),
-    });
-
-    await expect(sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true })).rejects.toThrow(
-      /runtime rejected policy/,
-    );
-  });
 
   it('setSetting upserts a single sandbox-scoped setting (global=false)', async () => {
     let req: {

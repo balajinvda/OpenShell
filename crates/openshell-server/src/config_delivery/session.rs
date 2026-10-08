@@ -238,13 +238,11 @@ impl ConfigSessionState {
     fn deliver(
         &mut self,
         message: SupervisorConfigMessage,
-        require_acknowledgement: bool,
     ) -> Result<Outgoing, DeliveryDisposition> {
         let component = message.component();
         let slots = Arc::clone(&self.slots);
         let delivery_state = self.component_mut(component);
-        if !require_acknowledgement
-            && delivery_state.in_flight.is_none()
+        if delivery_state.in_flight.is_none()
             && delivery_state.last_acknowledged_fingerprint.as_ref()
                 == Some(&ComponentSnapshot::from(&message).fingerprint())
         {
@@ -396,19 +394,15 @@ impl ConfigSessionState {
 impl SupervisorSessionRegistry {
     /// Hand a snapshot to the session it was built for. A replacement session
     /// received its own bootstrap and must not receive an older build.
-    ///
-    /// `require_acknowledgement` resends an unchanged snapshot because a
-    /// pending durable operation needs the supervisor's result for it.
     pub(crate) fn deliver_config(
         &self,
         sandbox_id: &str,
         session_id: &str,
         message: SupervisorConfigMessage,
-        require_acknowledgement: bool,
     ) -> DeliveryDisposition {
         let delivery = self.with_config_session(sandbox_id, session_id, |config| {
             config.map_or(Err(DeliveryDisposition::UnsupportedSession), |config| {
-                config.deliver(message, require_acknowledgement)
+                config.deliver(message)
             })
         });
         match delivery {
@@ -931,7 +925,6 @@ async fn record_component_apply_result(
         "outcome" => outcome.as_str_name(),
     )
     .increment(1);
-    crate::config_update_operation::complete_from_apply_result(state, sandbox_id, result).await?;
     if component != ConfigComponent::SandboxConfig {
         return Ok(());
     }
@@ -1466,8 +1459,7 @@ mod tests {
             SupervisorSessionRegistry::new().deliver_config(
                 "missing",
                 "session",
-                SupervisorConfigMessage::SandboxConfig(Box::default()),
-                false,
+                SupervisorConfigMessage::SandboxConfig(Box::default())
             ),
             DeliveryDisposition::NoActiveSession
         );
@@ -1482,17 +1474,12 @@ mod tests {
             register_apply_session_with_outbound(&registry, "sb-1", "session-1");
 
         assert_eq!(
-            registry.deliver_config("sb-1", "session-1", sandbox_config(1), false),
+            registry.deliver_config("sb-1", "session-1", sandbox_config(1)),
             DeliveryDisposition::Queued
         );
         for config_revision in [2, 3] {
             assert_eq!(
-                registry.deliver_config(
-                    "sb-1",
-                    "session-1",
-                    sandbox_config(config_revision),
-                    false
-                ),
+                registry.deliver_config("sb-1", "session-1", sandbox_config(config_revision)),
                 DeliveryDisposition::Coalesced
             );
         }
@@ -1500,8 +1487,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "session-1",
-                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot::default()),
-                false,
+                SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot::default())
             ),
             DeliveryDisposition::Queued,
             "components are acknowledged independently"
@@ -1564,8 +1550,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "old-session",
-                SupervisorConfigMessage::SandboxConfig(Box::default()),
-                false,
+                SupervisorConfigMessage::SandboxConfig(Box::default())
             ),
             DeliveryDisposition::NoActiveSession
         );
@@ -1573,8 +1558,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "new-session",
-                SupervisorConfigMessage::SandboxConfig(Box::default()),
-                false,
+                SupervisorConfigMessage::SandboxConfig(Box::default())
             ),
             DeliveryDisposition::Queued
         );
@@ -1591,8 +1575,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "session-1",
-                SupervisorConfigMessage::SandboxConfig(Box::default()),
-                false,
+                SupervisorConfigMessage::SandboxConfig(Box::default())
             ),
             DeliveryDisposition::UnsupportedSession
         );
@@ -1618,8 +1601,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "session-1",
-                SupervisorConfigMessage::ProviderEnvironment(snapshot),
-                false,
+                SupervisorConfigMessage::ProviderEnvironment(snapshot)
             ),
             DeliveryDisposition::PayloadTooLarge
         );
@@ -1720,8 +1702,7 @@ mod tests {
                 SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
                     provider_env_revision: 8,
                     ..Default::default()
-                }),
-                false,
+                })
             ),
             DeliveryDisposition::Queued
         );
@@ -1826,8 +1807,7 @@ mod tests {
             registry.deliver_config(
                 "sb-1",
                 "session-1",
-                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
-                false,
+                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot))
             ),
             DeliveryDisposition::SuppressedUnchanged
         );
@@ -2000,12 +1980,9 @@ mod tests {
         };
         let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
         assert_eq!(
-            state.supervisor_sessions.deliver_config(
-                sandbox_id,
-                "session-1",
-                message.clone(),
-                false
-            ),
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
             DeliveryDisposition::Queued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =
@@ -2036,7 +2013,7 @@ mod tests {
         assert_eq!(
             state
                 .supervisor_sessions
-                .deliver_config(sandbox_id, "session-1", message, false),
+                .deliver_config(sandbox_id, "session-1", message),
             DeliveryDisposition::Queued,
             "a non-durable admission must leave the revision eligible for repair"
         );
@@ -2088,12 +2065,9 @@ mod tests {
         };
         let message = SupervisorConfigMessage::SandboxConfig(Box::new(snapshot.clone()));
         assert_eq!(
-            state.supervisor_sessions.deliver_config(
-                sandbox_id,
-                "session-1",
-                message.clone(),
-                false
-            ),
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
             DeliveryDisposition::Queued
         );
         let Some(gateway_message::Payload::ConfigUpdate(update)) =
@@ -2206,7 +2180,7 @@ mod tests {
         });
         let send = |message: &SupervisorConfigMessage| {
             assert_eq!(
-                registry.deliver_config("sb-1", "session-1", message.clone(), false),
+                registry.deliver_config("sb-1", "session-1", message.clone()),
                 DeliveryDisposition::Queued
             );
             sent_update(slots.take_for_test().expect("delivered update"))
@@ -2331,12 +2305,9 @@ mod tests {
 
         let message = sandbox_config(7);
         assert_eq!(
-            state.supervisor_sessions.deliver_config(
-                sandbox_id,
-                "session-1",
-                message.clone(),
-                false
-            ),
+            state
+                .supervisor_sessions
+                .deliver_config(sandbox_id, "session-1", message.clone()),
             DeliveryDisposition::Queued
         );
         let update = sent_update(
@@ -2563,8 +2534,7 @@ mod tests {
                 "session-1",
                 SupervisorConfigMessage::ProviderEnvironment(
                     bootstrap.provider_environment.unwrap()
-                ),
-                false,
+                )
             ),
             DeliveryDisposition::SuppressedUnchanged
         );
@@ -2595,8 +2565,7 @@ mod tests {
                 "session-1",
                 SupervisorConfigMessage::ProviderEnvironment(
                     bootstrap.provider_environment.unwrap()
-                ),
-                false,
+                )
             ),
             DeliveryDisposition::Queued
         );
@@ -2682,7 +2651,7 @@ mod tests {
             &fingerprint,
         ));
         assert_eq!(
-            registry.deliver_config("sb-1", "session-1", message, false),
+            registry.deliver_config("sb-1", "session-1", message),
             DeliveryDisposition::SuppressedUnchanged
         );
 
@@ -2692,7 +2661,7 @@ mod tests {
                 ..snapshot.clone()
             });
         assert_eq!(
-            registry.deliver_config("sb-1", "session-1", policy_changed, false),
+            registry.deliver_config("sb-1", "session-1", policy_changed),
             DeliveryDisposition::Queued
         );
         assert!(slots.take_for_test().ok_or(()).is_ok());
@@ -2724,8 +2693,7 @@ mod tests {
                 SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
                     provider_attachment_epoch: "epoch-2".into(),
                     ..snapshot
-                }),
-                false,
+                })
             ),
             DeliveryDisposition::Queued
         );
@@ -2852,7 +2820,7 @@ mod tests {
             &config_message_fingerprint(&message),
         ));
         assert_eq!(
-            registry.deliver_config("sb-1", "session-1", message, false),
+            registry.deliver_config("sb-1", "session-1", message),
             DeliveryDisposition::SuppressedUnchanged
         );
         assert_eq!(
@@ -2862,8 +2830,7 @@ mod tests {
                 SupervisorConfigMessage::SandboxConfig(Box::new(SandboxConfigSnapshot {
                     provider_env_revision: 12,
                     ..snapshot
-                })),
-                false,
+                }))
             ),
             DeliveryDisposition::Queued
         );

@@ -107,57 +107,6 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
-impl StoredConfigUpdateOperation {
-    /// Missing retry time is immediately due; invalid stored time must never be claimed.
-    pub(crate) fn next_attempt_at_ms(&self) -> i64 {
-        self.next_attempt_time.as_ref().map_or(0, |time| {
-            openshell_core::time::timestamp_to_millis(time).unwrap_or(i64::MAX)
-        })
-    }
-}
-
-impl ObjectId for StoredConfigUpdateOperation {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for StoredConfigUpdateOperation {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredConfigUpdateOperation {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredConfigUpdateOperation {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredConfigUpdateOperation {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-impl ObjectWorkspace for StoredConfigUpdateOperation {
-    fn object_workspace(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
-    }
-
-    fn requires_workspace() -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,11 +141,8 @@ mod tests {
     // traffic and are never stored.
     // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
     // stored operations but never recorded on one: it is not terminal.
-    // UpdateConfigRequest carries only wait_mode and wait_timeout for
-    // completion; request_id replay covers retries, so the request has no
-    // separate idempotency key. Requests are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "c1a493e428d0789d6eb8e8e388e0f681412f0f852e3cd1ebf28e923b74458ed3";
+        "ef46c2cf3c8693e4ae64c709776ad6b8a110f0b51fdf346f1757d20868d10a22";
     const DURABLE_SCHEMA_SHA256: &str =
         "175abd05375cf02b72f1c1b5b92bbbe7e20033fdca9e616a14469db178c92f8b";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -617,14 +563,14 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -634,7 +580,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            77 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -680,7 +626,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 29),
+                (328, 28),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

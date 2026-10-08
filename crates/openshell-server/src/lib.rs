@@ -36,7 +36,6 @@ mod otel_tracing;
 mod pagination;
 mod persistence;
 pub(crate) mod policy_store;
-mod provider_config_operation;
 mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
@@ -280,9 +279,6 @@ pub struct ServerState {
     /// In-memory bus for sandbox update notifications.
     pub sandbox_watch_bus: SandboxWatchBus,
 
-    /// Gateway-local wakeups for durable configuration-operation waiters.
-    pub(crate) config_update_operation_watch_bus: config_update_operation::OperationWatchBus,
-
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
 
@@ -449,7 +445,6 @@ impl ServerState {
             credentials,
             sandbox_index,
             sandbox_watch_bus,
-            config_update_operation_watch_bus: config_update_operation::OperationWatchBus::new(),
             tracing_log_bus,
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
@@ -990,7 +985,6 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     config_delivery::spawn_owner_reconciler(state.clone(), Duration::from_secs(30));
-    config_update_operation::spawn_reconciler(state.clone(), Duration::from_secs(5));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;

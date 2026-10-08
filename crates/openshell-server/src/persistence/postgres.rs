@@ -2,18 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    AtomicSandboxProjection, ConfigOperationRow, DraftChunkRecord, ObjectCursor, ObjectListQuery,
-    ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord, WriteCondition, WriteResult,
-    current_time_ms, decode_sandbox_payload, ensure_sandbox_accepts_operations, map_db_error,
-    map_migrate_error, pending_operation_status,
+    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
+    map_migrate_error,
 };
-use crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE;
 use crate::policy_store::{
     AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
     policy_record_for_atomic_write, policy_record_from_parts, project_policy_revision_onto_sandbox,
 };
-use crate::storage_proto::StoredConfigUpdateOperation;
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
@@ -32,90 +29,6 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 }
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
-
-/// Lock the sandbox row that a desired-state transaction projects onto. The
-/// row lock also orders an operation insert with sandbox deletion's phase
-/// change.
-async fn lock_sandbox_row(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    sandbox_id: &str,
-) -> PersistenceResult<(Vec<u8>, u64)> {
-    let row = sqlx::query(
-        r"
-SELECT payload, resource_version
-FROM objects
-WHERE object_type = 'sandbox' AND id = $1
-FOR UPDATE
-",
-    )
-    .bind(sandbox_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| map_db_error(&e))?
-    .ok_or_else(|| PersistenceError::Database(format!("sandbox object {sandbox_id} not found")))?;
-    let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
-    Ok((row.get("payload"), current_version.max(1).cast_unsigned()))
-}
-
-/// Replace a sandbox payload locked earlier in the same transaction. Returns
-/// the new resource version.
-async fn update_sandbox_payload(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    sandbox_id: &str,
-    sandbox: &Sandbox,
-    current_version: u64,
-    now_ms: i64,
-) -> PersistenceResult<u64> {
-    let result = sqlx::query(
-        r"
-UPDATE objects
-SET payload = $2, updated_at_ms = $3, resource_version = resource_version + 1
-WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4
-",
-    )
-    .bind(sandbox_id)
-    .bind(sandbox.encode_to_vec())
-    .bind(now_ms)
-    .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| map_db_error(&e))?;
-    if result.rows_affected() != 1 {
-        return Err(PersistenceError::Conflict {
-            current_resource_version: Some(current_version),
-        });
-    }
-    Ok(current_version.saturating_add(1))
-}
-
-async fn insert_config_operation(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    row: &ConfigOperationRow<'_>,
-    now_ms: i64,
-) -> PersistenceResult<()> {
-    sqlx::query(
-        r"
-INSERT INTO objects (
-    object_type, id, name, workspace, scope, status, payload,
-    created_at_ms, updated_at_ms, labels, resource_version, next_attempt_at_ms
-)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, '{}'::jsonb, 1, $9)
-",
-    )
-    .bind(CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
-    .bind(row.id)
-    .bind(row.name)
-    .bind(row.workspace)
-    .bind(row.sandbox_id)
-    .bind(row.status)
-    .bind(&row.payload)
-    .bind(now_ms)
-    .bind(row.next_attempt_at_ms)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| map_db_error(&e))?;
-    Ok(())
-}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
@@ -420,196 +333,6 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                 })
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn put_sandbox_settings_atomic(
-        &self,
-        object_type: &str,
-        id: &str,
-        name: &str,
-        workspace: &str,
-        payload: &[u8],
-        condition: WriteCondition,
-        sandbox_projection: &AtomicSandboxProjection<'_>,
-        operation: Option<&StoredConfigUpdateOperation>,
-    ) -> PersistenceResult<Sandbox> {
-        let now_ms = current_time_ms();
-        let operation = operation.map(ConfigOperationRow::new).transpose()?;
-        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
-        let (sandbox_payload, current_version) =
-            lock_sandbox_row(&mut tx, sandbox_projection.sandbox_id).await?;
-        let (mut sandbox, changed) = sandbox_projection.apply(&sandbox_payload, current_version)?;
-        if operation.is_some() {
-            ensure_sandbox_accepts_operations(&sandbox)?;
-        }
-        match condition {
-            WriteCondition::MustCreate => {
-                sqlx::query(
-                    r"
-INSERT INTO objects (object_type, id, name, workspace, payload, created_at_ms, updated_at_ms, labels, resource_version)
-VALUES ($1, $2, $3, $4, $5, $6, $6, '{}'::jsonb, 1)
-",
-                )
-                .bind(object_type)
-                .bind(id)
-                .bind(name)
-                .bind(workspace)
-                .bind(payload)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| map_db_error(&e))?;
-            }
-            WriteCondition::MatchResourceVersion(expected) => {
-                let result = sqlx::query(
-                    r"
-UPDATE objects
-SET payload = $4, updated_at_ms = $5, resource_version = resource_version + 1
-WHERE object_type = $1 AND id = $2 AND resource_version = $3
-",
-                )
-                .bind(object_type)
-                .bind(id)
-                .bind(i64::try_from(expected).unwrap_or(i64::MAX))
-                .bind(payload)
-                .bind(now_ms)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| map_db_error(&e))?;
-                if result.rows_affected() != 1 {
-                    return Err(PersistenceError::Conflict {
-                        current_resource_version: None,
-                    });
-                }
-            }
-            WriteCondition::Unconditional => {
-                return Err(PersistenceError::Config(
-                    "atomic settings write requires a CAS condition".to_string(),
-                ));
-            }
-        }
-        let resulting_version = if changed {
-            update_sandbox_payload(
-                &mut tx,
-                sandbox_projection.sandbox_id,
-                &sandbox,
-                current_version,
-                now_ms,
-            )
-            .await?
-        } else {
-            current_version
-        };
-        if let Some(operation) = operation.as_ref() {
-            insert_config_operation(&mut tx, operation, now_ms).await?;
-        }
-        tx.commit().await.map_err(|e| map_db_error(&e))?;
-        sandbox.set_resource_version(resulting_version);
-        Ok(sandbox)
-    }
-
-    /// Track an unchanged request without allocating a new desired-state revision.
-    pub async fn insert_existing_config_operation(
-        &self,
-        record: &StoredConfigUpdateOperation,
-    ) -> PersistenceResult<()> {
-        let operation = ConfigOperationRow::new(record)?;
-        let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
-        let (sandbox_payload, current_version) =
-            lock_sandbox_row(&mut tx, operation.sandbox_id).await?;
-        ensure_sandbox_accepts_operations(&decode_sandbox_payload(
-            &sandbox_payload,
-            current_version,
-        )?)?;
-        insert_config_operation(&mut tx, &operation, current_time_ms()).await?;
-        tx.commit().await.map_err(|e| map_db_error(&e))
-    }
-
-    pub async fn update_config_operation_cas(
-        &self,
-        record: &StoredConfigUpdateOperation,
-        expected_resource_version: u64,
-    ) -> PersistenceResult<Option<u64>> {
-        let operation = ConfigOperationRow::new(record)?;
-        let result = sqlx::query(
-            r"
-UPDATE objects
-SET payload = $4, status = $5, next_attempt_at_ms = $6,
-    updated_at_ms = $7, resource_version = resource_version + 1
-WHERE object_type = $1 AND id = $2 AND resource_version = $3
-",
-        )
-        .bind(CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
-        .bind(operation.id)
-        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
-        .bind(&operation.payload)
-        .bind(operation.status)
-        .bind(operation.next_attempt_at_ms)
-        .bind(current_time_ms())
-        .execute(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-        Ok((result.rows_affected() == 1).then(|| expected_resource_version.saturating_add(1)))
-    }
-
-    pub async fn list_pending_config_operations_for_scope(
-        &self,
-        scope: &str,
-    ) -> PersistenceResult<Vec<ObjectRecord>> {
-        let rows = sqlx::query(
-            r"
-SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms,
-       labels, resource_version
-FROM objects
-WHERE object_type = $1 AND status = $2 AND scope = $3
-ORDER BY created_at_ms ASC, id ASC
-",
-        )
-        .bind(CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
-        .bind(pending_operation_status())
-        .bind(scope)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-        Ok(rows.into_iter().map(row_to_object_record).collect())
-    }
-
-    pub async fn list_due_config_update_operations(
-        &self,
-        now_ms: i64,
-        limit: u32,
-    ) -> PersistenceResult<Vec<ObjectRecord>> {
-        let rows = sqlx::query(
-            r"
-SELECT object_type, id, name, workspace, payload, created_at_ms, updated_at_ms,
-       labels, resource_version
-FROM objects
-WHERE object_type = $1 AND status = $2 AND next_attempt_at_ms <= $3
-ORDER BY next_attempt_at_ms ASC, id ASC
-LIMIT $4
-",
-        )
-        .bind(CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
-        .bind(pending_operation_status())
-        .bind(now_ms)
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-        Ok(rows.into_iter().map(row_to_object_record).collect())
-    }
-
-    pub async fn count_pending_config_update_operations(&self) -> PersistenceResult<u64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM objects WHERE object_type = $1 AND status = $2",
-        )
-        .bind(CONFIG_UPDATE_OPERATION_OBJECT_TYPE)
-        .bind(pending_operation_status())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
-        Ok(count.max(0).cast_unsigned())
     }
 
     pub async fn delete_if(
@@ -1385,28 +1108,49 @@ ON CONFLICT DO NOTHING
         let wrapped_payload = policy_payload_from_record(&record)?;
         let mut tx = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
 
-        let (sandbox_payload, current_version) =
-            lock_sandbox_row(&mut tx, &write.sandbox_id).await?;
+        let row = sqlx::query(
+            r"
+SELECT payload, resource_version
+FROM objects
+WHERE object_type = 'sandbox' AND id = $1
+FOR UPDATE
+",
+        )
+        .bind(&write.sandbox_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        .ok_or_else(|| {
+            PersistenceError::Database(format!("sandbox object {} not found", write.sandbox_id))
+        })?;
+
+        let sandbox_payload: Vec<u8> = row.get("payload");
+        let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
+        let current_version = current_version.max(1).cast_unsigned();
         let (mut sandbox, sandbox_changed) =
             project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
-        let operation = write
-            .operation
-            .as_ref()
-            .map(ConfigOperationRow::new)
-            .transpose()?;
-        if operation.is_some() {
-            ensure_sandbox_accepts_operations(&sandbox)?;
-        }
 
         let resulting_version = if sandbox_changed {
-            update_sandbox_payload(
-                &mut tx,
-                &write.sandbox_id,
-                &sandbox,
-                current_version,
-                now_ms,
+            let result = sqlx::query(
+                r"
+UPDATE objects
+SET payload = $2, updated_at_ms = $3, resource_version = resource_version + 1
+WHERE object_type = 'sandbox' AND id = $1 AND resource_version = $4
+",
             )
-            .await?
+            .bind(&write.sandbox_id)
+            .bind(sandbox.encode_to_vec())
+            .bind(now_ms)
+            .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+            if result.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: Some(current_version),
+                });
+            }
+            current_version.saturating_add(1)
         } else {
             current_version
         };
@@ -1430,10 +1174,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
         .execute(&mut *tx)
         .await
         .map_err(|e| map_db_error(&e))?;
-
-        if let Some(operation) = operation.as_ref() {
-            insert_config_operation(&mut tx, operation, now_ms).await?;
-        }
 
         sqlx::query(
             r"

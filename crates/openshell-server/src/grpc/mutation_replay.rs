@@ -480,11 +480,6 @@ fn decode_request_message(name: &str, request: &impl Message) -> Result<DynamicM
 fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
     let mut message = request.canonical_message()?;
     message.clear_field_by_name("request_id");
-    if M::METHOD == "UpdateConfig" {
-        // Waiting changes response timing, never the admitted mutation identity.
-        message.clear_field_by_name("wait_mode");
-        message.clear_field_by_name("wait_timeout");
-    }
     let value = serde_json::to_value(message)
         .map_err(|_| Status::internal("canonicalize mutation request"))?;
     hash_json(&value)

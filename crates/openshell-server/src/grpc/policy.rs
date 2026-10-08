@@ -25,9 +25,8 @@ pub use endpoint_status::{
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
-    MinWorkspaceRole, authorize_workspace, require_platform_admin, selected_workspace_name,
+    MinWorkspaceRole, require_platform_admin, selected_workspace_name,
 };
-use crate::config_update_operation::{self, OperationTarget};
 use crate::pagination::Pagination;
 use crate::persistence::ObjectType;
 use crate::persistence::{
@@ -37,7 +36,6 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use crate::storage_proto::StoredConfigUpdateOperation;
 use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
 #[cfg(test)]
 use crate::storage_proto::StoredProviderProfile;
@@ -54,8 +52,7 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
-    GetConfigUpdateOperationRequest, GetConfigUpdateOperationResponse, GetDraftHistoryRequest,
-    GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
@@ -135,67 +132,14 @@ const STORED_POLICY_SOURCE_GLOBAL: &str = "global policy setting";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
-pub(super) fn config_wait_timeout(
-    value: Option<&prost_types::Duration>,
-) -> Result<std::time::Duration, Status> {
-    value
-        .map(openshell_core::time::duration_to_std)
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .map_err(|_| Status::invalid_argument("wait_timeout must be a nonnegative duration"))
-}
-
-/// Push delivery tracks the completion of sandbox-scoped updates with durable
-/// operations. Polling supervisors report no apply results, so poll mode
-/// records none.
-fn tracks_config_completion(state: &ServerState) -> bool {
-    crate::config_delivery::push_enabled(state)
-}
-
-/// Create the completion operation committed with a sandbox-scoped update.
-fn new_config_operation(
-    sandbox: &Sandbox,
-    target: OperationTarget,
-) -> (StoredConfigUpdateOperation, String) {
-    let record = config_update_operation::new_record(sandbox, target);
-    let operation_id = record.object_id().to_string();
-    (record, operation_id)
-}
-
-/// Respond to a sandbox-scoped update. With completion tracking, a changed
-/// desired value carries the operation committed with it, and an unchanged
-/// value gets a new operation for `current_target`. The `UpdateConfig`
-/// service wrapper owns any wait for a terminal result.
-async fn finish_sandbox_config_update(
+/// Push a committed sandbox-scoped change to the sandbox's supervisor. A
+/// policy change also changes the provider environment's credential bindings.
+fn publish_sandbox_config_update(
     state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-    committed_operation: Option<String>,
-    current_target: OperationTarget,
-    mut response: Response<UpdateConfigResponse>,
-) -> Result<Response<UpdateConfigResponse>, Status> {
-    if !tracks_config_completion(state) {
-        return Ok(response);
-    }
-    let operation_id = if let Some(operation_id) = committed_operation {
-        operation_id
-    } else {
-        let (record, operation_id) = new_config_operation(sandbox, current_target);
-        state
-            .store
-            .insert_existing_config_operation(&record)
-            .await
-            .map_err(|error| {
-                super::persistence_error_to_status(error, "persist unchanged update operation")
-            })?;
-        operation_id
-    };
-    config_update_operation::reconcile_one(state, &operation_id).await?;
-    // Deleting the sandbox also deletes its operations.
-    response.get_mut().operation = config_update_operation::get_record(state, &operation_id)
-        .await?
-        .map(|record| config_update_operation::public_operation(&record))
-        .transpose()?;
-    Ok(response)
+    sandbox_id: &str,
+    components: crate::config_delivery::ConfigComponents,
+) {
+    crate::config_delivery::publish_sandbox_components(state, sandbox_id, components);
 }
 
 // Private wire-only compatibility types for policy history written before
@@ -2678,7 +2622,6 @@ fn update_config_response(
         settings_revision,
         deleted,
         annotations,
-        operation: None,
     })
 }
 
@@ -4255,7 +4198,6 @@ async fn handle_update_config_inner(
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
-    let track_completion = tracks_config_completion(state);
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
@@ -4283,43 +4225,38 @@ async fn handle_update_config_inner(
                 load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name())
                     .await?;
             let removed = sandbox_settings.settings.remove(key).is_some();
-            let mut operation_id = None;
             if removed {
                 sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
-                (response_annotations, operation_id) = save_sandbox_settings_atomic(
+                save_sandbox_settings(
                     state.store.as_ref(),
-                    &sandbox,
+                    &workspace,
+                    sandbox.object_name(),
                     &sandbox_settings,
-                    &req.annotations,
-                    req.expected_resource_version,
-                    track_completion,
                 )
                 .await?;
-            } else {
-                response_annotations = persist_update_config_annotations(
+                publish_sandbox_config_update(
                     state,
                     &sandbox_id,
-                    req.expected_resource_version,
-                    &req.annotations,
-                    &response_annotations,
-                )
-                .await?;
+                    crate::config_delivery::ConfigComponents::SANDBOX_CONFIG,
+                );
             }
 
-            return Box::pin(finish_sandbox_config_update(
+            response_annotations = persist_update_config_annotations(
                 state,
-                &sandbox,
-                operation_id,
-                OperationTarget::SettingsRevision(sandbox_settings.revision),
-                update_config_response(
-                    0,
-                    String::new(),
-                    sandbox_settings.revision,
-                    removed,
-                    response_annotations,
-                ),
-            ))
-            .await;
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+            )
+            .await?;
+
+            return Ok(update_config_response(
+                0,
+                String::new(),
+                sandbox_settings.revision,
+                removed,
+                response_annotations,
+            ));
         }
 
         if globally_managed {
@@ -4337,43 +4274,38 @@ async fn handle_update_config_inner(
         let mut sandbox_settings =
             load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
         let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
-        let mut operation_id = None;
         if changed {
             sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
-            (response_annotations, operation_id) = save_sandbox_settings_atomic(
+            save_sandbox_settings(
                 state.store.as_ref(),
-                &sandbox,
+                &workspace,
+                sandbox.object_name(),
                 &sandbox_settings,
-                &req.annotations,
-                req.expected_resource_version,
-                track_completion,
             )
             .await?;
-        } else {
-            response_annotations = persist_update_config_annotations(
+            publish_sandbox_config_update(
                 state,
                 &sandbox_id,
-                req.expected_resource_version,
-                &req.annotations,
-                &response_annotations,
-            )
-            .await?;
+                crate::config_delivery::ConfigComponents::SANDBOX_CONFIG,
+            );
         }
 
-        return Box::pin(finish_sandbox_config_update(
+        response_annotations = persist_update_config_annotations(
             state,
-            &sandbox,
-            operation_id,
-            OperationTarget::SettingsRevision(sandbox_settings.revision),
-            update_config_response(
-                0,
-                String::new(),
-                sandbox_settings.revision,
-                false,
-                response_annotations,
-            ),
-        ))
-        .await;
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
+        )
+        .await?;
+
+        return Ok(update_config_response(
+            0,
+            String::new(),
+            sandbox_settings.revision,
+            false,
+            response_annotations,
+        ));
     }
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
@@ -4401,10 +4333,9 @@ async fn handle_update_config_inner(
             expected_resource_version: req.expected_resource_version,
             provenance: &req.annotations,
             annotations: &req.annotations,
-            operation_sandbox: track_completion.then_some(&sandbox),
         };
         let baseline_policy = spec.policy.clone();
-        let (version, hash, updated_sandbox, operation_id) = apply_merge_operations_with_retry(
+        let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             &workspace,
@@ -4467,15 +4398,19 @@ async fn handle_update_config_inner(
         spawn_pending_chunk_refresh(state, &workspace, &sandbox);
         emit_config_update_policy_success(sandbox_caller);
 
-        let version = u32::try_from(version).unwrap_or(0);
-        return Box::pin(finish_sandbox_config_update(
+        publish_sandbox_config_update(
             state,
-            &sandbox,
-            operation_id,
-            OperationTarget::PolicyVersion(version),
-            update_config_response(version, hash, 0, false, response_annotations),
-        ))
-        .await;
+            &sandbox_id,
+            crate::config_delivery::ConfigComponents::ALL,
+        );
+
+        return Ok(update_config_response(
+            u32::try_from(version).unwrap_or(0),
+            hash,
+            0,
+            false,
+            response_annotations,
+        ));
     }
 
     // Sandbox-scoped policy update.
@@ -4558,7 +4493,7 @@ async fn handle_update_config_inner(
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
-    let (next_version, committed_annotations, operation_id) = {
+    let (next_version, committed_annotations) = {
         let mut committed = None;
         for attempt in 1..=MERGE_RETRY_LIMIT {
             let latest = state
@@ -4585,29 +4520,22 @@ async fn handle_update_config_inner(
                         sandbox_id = %sandbox_id,
                         "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
                     );
+                    publish_sandbox_config_update(
+                        state,
+                        &sandbox_id,
+                        crate::config_delivery::ConfigComponents::ALL,
+                    );
                 }
-                let version = u32::try_from(current.version).unwrap_or(0);
-                return Box::pin(finish_sandbox_config_update(
-                    state,
-                    &sandbox,
-                    None,
-                    OperationTarget::PolicyVersion(version),
-                    update_config_response(version, hash, 0, false, response_annotations),
-                ))
-                .await;
+                return Ok(update_config_response(
+                    u32::try_from(current.version).unwrap_or(0),
+                    hash,
+                    0,
+                    false,
+                    response_annotations,
+                ));
             }
 
             let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
-            let (operation, operation_id) = track_completion
-                .then(|| {
-                    new_config_operation(
-                        &sandbox,
-                        OperationTarget::PolicyVersion(
-                            u32::try_from(next_version).unwrap_or(u32::MAX),
-                        ),
-                    )
-                })
-                .unzip();
             let write = AtomicPolicyRevisionWrite {
                 id: uuid::Uuid::new_v4().to_string(),
                 sandbox_id: sandbox_id.clone(),
@@ -4619,16 +4547,12 @@ async fn handle_update_config_inner(
                 expected_resource_version: req.expected_resource_version,
                 annotations: req.annotations.clone(),
                 backfill_policy: backfill_policy.clone(),
-                operation,
             };
 
             match state.store.put_policy_revision_atomic(&write).await {
                 Ok(updated_sandbox) => {
-                    committed = Some((
-                        next_version,
-                        sandbox_metadata_annotations(&updated_sandbox),
-                        operation_id,
-                    ));
+                    committed =
+                        Some((next_version, sandbox_metadata_annotations(&updated_sandbox)));
                     break;
                 }
                 Err(error) if error.is_unique_violation_on("objects_version_uq") => {
@@ -4656,6 +4580,11 @@ async fn handle_update_config_inner(
     };
     response_annotations = committed_annotations;
     state.sandbox_watch_bus.notify(&sandbox_id);
+    publish_sandbox_config_update(
+        state,
+        &sandbox_id,
+        crate::config_delivery::ConfigComponents::ALL,
+    );
     // The committed revision changed what pending proposals were evaluated
     // against. Schedule the refresh here: the matching-revision check below
     // returns before the end of this handler for every committed write.
@@ -4677,15 +4606,13 @@ async fn handle_update_config_inner(
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    let next_version = u32::try_from(next_version).unwrap_or(0);
-    Box::pin(finish_sandbox_config_update(
-        state,
-        &sandbox,
-        operation_id,
-        OperationTarget::PolicyVersion(next_version),
-        update_config_response(next_version, hash, 0, false, response_annotations),
+    Ok(update_config_response(
+        u32::try_from(next_version).unwrap_or(0),
+        hash,
+        0,
+        false,
+        response_annotations,
     ))
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -4753,40 +4680,6 @@ pub(super) async fn handle_get_sandbox_policy_status(
     Ok(Response::new(GetSandboxPolicyStatusResponse {
         revision: Some(policy_record_to_revision(&record, true)?),
         active_version,
-    }))
-}
-
-pub(super) async fn handle_get_config_update_operation(
-    state: &Arc<ServerState>,
-    request: Request<GetConfigUpdateOperationRequest>,
-) -> Result<Response<GetConfigUpdateOperationResponse>, Status> {
-    let principal = super::extract_principal(&request)?;
-    let req = request.into_inner();
-    if req.operation_id.is_empty() {
-        return Err(Status::invalid_argument("operation_id is required"));
-    }
-    let authz = authorize_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        selected_workspace_name(req.workspace_scope.as_ref())?,
-        MinWorkspaceRole::User,
-    )
-    .await?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-        .await?
-        .name;
-    let record = config_update_operation::get_record(state, &req.operation_id)
-        .await?
-        .filter(|record| {
-            record
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.workspace == workspace)
-        })
-        .ok_or_else(|| Status::not_found("update operation not found"))?;
-    Ok(Response::new(GetConfigUpdateOperationResponse {
-        operation: Some(config_update_operation::public_operation(&record)?),
     }))
 }
 
@@ -6353,7 +6246,7 @@ async fn handle_approve_all_draft_chunks_inner(
         )
         .await
         {
-            Ok((version, hash, _, _)) => (version, hash),
+            Ok((version, hash, _)) => (version, hash),
             Err(status) => {
                 for (chunk, _, _) in &accepted {
                     persist_pending_application_error(state, &chunk.id, &status).await;
@@ -7338,9 +7231,6 @@ struct AtomicPolicyWriteContext<'a> {
     expected_resource_version: u64,
     provenance: &'a HashMap<String, String>,
     annotations: &'a HashMap<String, String>,
-    /// Sandbox whose completion operation commits with the revision; `None`
-    /// when completion is not tracked.
-    operation_sandbox: Option<&'a Sandbox>,
 }
 
 struct PolicyCredentialBindingValidationContext<'a> {
@@ -7495,7 +7385,7 @@ async fn apply_merge_operations_with_retry(
     validation_context: PolicyMergeValidationContext<'_>,
     expected_current_effective_hash: Option<&str>,
     atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
-) -> Result<(i64, String, Option<Sandbox>, Option<String>), Status> {
+) -> Result<(i64, String, Option<Sandbox>), Status> {
     let provider_layers = validation_context.provider_layers;
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
@@ -7554,11 +7444,11 @@ async fn apply_merge_operations_with_retry(
             && current_hash.as_deref() == Some(hash.as_str())
             && atomic_context.is_none_or(|context| current.provenance == *context.provenance)
         {
-            return Ok((current.version, hash, None, None));
+            return Ok((current.version, hash, None));
         }
 
         if latest.is_none() && !merged.changed {
-            return Ok((0, hash, None, None));
+            return Ok((0, hash, None));
         }
 
         let payload = new_policy.encode_to_vec();
@@ -7566,17 +7456,6 @@ async fn apply_merge_operations_with_retry(
         let policy_id = uuid::Uuid::new_v4().to_string();
 
         let write_result = if let Some(context) = atomic_context {
-            let (operation, operation_id) = context
-                .operation_sandbox
-                .map(|sandbox| {
-                    new_config_operation(
-                        sandbox,
-                        OperationTarget::PolicyVersion(
-                            u32::try_from(next_version).unwrap_or(u32::MAX),
-                        ),
-                    )
-                })
-                .unzip();
             store
                 .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
                     id: policy_id,
@@ -7589,10 +7468,9 @@ async fn apply_merge_operations_with_retry(
                     expected_resource_version: context.expected_resource_version,
                     annotations: context.annotations.clone(),
                     backfill_policy: None,
-                    operation,
                 })
                 .await
-                .map(|sandbox| (Some(sandbox), operation_id))
+                .map(Some)
         } else {
             store
                 .put_policy_revision(
@@ -7604,11 +7482,11 @@ async fn apply_merge_operations_with_retry(
                     &hash,
                 )
                 .await
-                .map(|()| (None, None))
+                .map(|()| None)
         };
 
         match write_result {
-            Ok((updated_sandbox, operation_id)) => {
+            Ok(updated_sandbox) => {
                 if atomic_context.is_none() {
                     let _ = store
                         .supersede_older_policies(sandbox_id, next_version)
@@ -7625,7 +7503,7 @@ async fn apply_merge_operations_with_retry(
                     );
                 }
 
-                return Ok((next_version, hash, updated_sandbox, operation_id));
+                return Ok((next_version, hash, updated_sandbox));
             }
             Err(e) => {
                 if e.is_unique_violation_on("objects_version_uq") {
@@ -7643,12 +7521,6 @@ async fn apply_merge_operations_with_retry(
                     );
                     tokio::task::yield_now().await;
                     continue;
-                }
-                if matches!(e, crate::persistence::PersistenceError::SandboxDeleting) {
-                    return Err(super::persistence_error_to_status(
-                        e,
-                        "persist policy revision",
-                    ));
                 }
                 return Err(Status::internal(format!(
                     "persist policy revision failed: {e}"
@@ -7693,7 +7565,7 @@ async fn merge_chunk_into_policy_with_validation(
         None,
     )
     .await
-    .map(|(version, hash, _, _)| (version, hash))
+    .map(|(version, hash, _)| (version, hash))
 }
 
 #[cfg(test)]
@@ -7740,7 +7612,7 @@ async fn remove_chunk_from_policy(
         None,
     )
     .await
-    .map(|(version, hash, _, _)| (version, hash))
+    .map(|(version, hash, _)| (version, hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -7861,7 +7733,6 @@ pub(super) async fn load_sandbox_settings(
     load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, workspace, sandbox_name).await
 }
 
-#[cfg(test)]
 pub(super) async fn save_sandbox_settings(
     store: &Store,
     workspace: &str,
@@ -7876,73 +7747,6 @@ pub(super) async fn save_sandbox_settings(
         settings,
     )
     .await
-}
-
-/// Persist sandbox settings and project request annotations onto the sandbox
-/// in one transaction, together with the update's completion operation when
-/// completion is tracked. Returns the committed sandbox annotations and the
-/// operation ID.
-async fn save_sandbox_settings_atomic(
-    store: &Store,
-    sandbox: &Sandbox,
-    settings: &StoredSettings,
-    annotations: &HashMap<String, String>,
-    expected_resource_version: u64,
-    track_completion: bool,
-) -> Result<(HashMap<String, String>, Option<String>), Status> {
-    use crate::persistence::WriteCondition;
-
-    let workspace = sandbox.object_workspace();
-    let sandbox_name = sandbox.object_name();
-    let payload = serde_json::to_vec(settings)
-        .map_err(|error| Status::internal(format!("encode settings payload failed: {error}")))?;
-    let (id, condition) = if settings.resource_version == 0 {
-        (uuid::Uuid::new_v4().to_string(), WriteCondition::MustCreate)
-    } else {
-        let existing = store
-            .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, workspace, sandbox_name)
-            .await
-            .map_err(|error| Status::internal(format!("fetch settings for CAS failed: {error}")))?
-            .ok_or_else(|| Status::not_found("settings disappeared since load"))?;
-        (
-            existing.id,
-            WriteCondition::MatchResourceVersion(settings.resource_version),
-        )
-    };
-    let (operation, operation_id) = track_completion
-        .then(|| {
-            new_config_operation(
-                sandbox,
-                OperationTarget::SettingsRevision(settings.revision),
-            )
-        })
-        .unzip();
-    let projected = store
-        .put_sandbox_settings_atomic(
-            SANDBOX_SETTINGS_OBJECT_TYPE,
-            &id,
-            sandbox_name,
-            workspace,
-            &payload,
-            condition,
-            &crate::persistence::AtomicSandboxProjection {
-                sandbox_id: sandbox.object_id(),
-                annotations,
-                expected_resource_version,
-            },
-            operation.as_ref(),
-        )
-        .await
-        .map_err(|error| match error {
-            crate::persistence::PersistenceError::Conflict { .. } => {
-                Status::aborted("settings were modified concurrently; please retry")
-            }
-            crate::persistence::PersistenceError::UniqueViolation { .. } => {
-                Status::aborted("settings were created concurrently; please retry")
-            }
-            other => super::persistence_error_to_status(other, "persist sandbox settings"),
-        })?;
-    Ok((sandbox_metadata_annotations(&projected), operation_id))
 }
 
 async fn load_settings_record(
@@ -8146,9 +7950,6 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::{authed_request, test_server_state};
-    use openshell_core::proto::{
-        ConfigApplyOutcome, ConfigComponent, ConfigComponentApplyResult, ConfigUpdateWaitMode,
-    };
 
     /// An in-memory store with the example profiles imported at platform scope.
     ///
@@ -9884,7 +9685,7 @@ mod tests {
                 .await
                 .expect("store legacy merge base");
 
-            let (version, hash, _, _) = apply_merge_operations_with_retry(
+            let (version, hash, _) = apply_merge_operations_with_retry(
                 &store,
                 &sandbox_id,
                 "default",
@@ -13162,126 +12963,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn poll_mode_waited_update_returns_without_completion_operation() {
-        let state = test_server_state().await;
-        let sandbox = test_sandbox(
-            "sb-poll-wait",
-            "poll-wait",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-
-        // A polling supervisor reports no apply result, so the gateway answers
-        // a waited update as committed instead of waiting for completion.
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handle_update_config(
-                &state,
-                with_user(Request::new(UpdateConfigRequest {
-                    sandbox: sandbox.object_name().to_string(),
-                    setting_key: "ocsf_json_enabled".to_string(),
-                    setting_value: Some(SettingValue {
-                        value: Some(setting_value::Value::BoolValue(true)),
-                    }),
-                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                    wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
-                    ..Default::default()
-                })),
-            ),
-        )
-        .await
-        .expect("poll mode must not wait for completion")
-        .unwrap()
-        .into_inner();
-        assert!(response.operation.is_none());
-        assert!(
-            state
-                .store
-                .list_pending_config_operations_for_scope(sandbox.object_id())
-                .await
-                .unwrap()
-                .is_empty(),
-            "poll mode leaves no pending operation behind"
-        );
-    }
-
-    fn waited_setting_update(sandbox: &str) -> UpdateConfigRequest {
-        UpdateConfigRequest {
-            sandbox: sandbox.to_string(),
-            setting_key: "ocsf_json_enabled".to_string(),
-            setting_value: Some(SettingValue {
-                value: Some(setting_value::Value::BoolValue(true)),
-            }),
-            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-            wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
-            wait_timeout: openshell_core::time::duration_from_std(std::time::Duration::from_secs(
-                5,
-            ))
-            .ok(),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn poll_mode_waited_update_succeeds_through_the_service() {
-        use openshell_core::proto::open_shell_server::OpenShell as _;
-
-        let state = test_server_state().await;
-        let sandbox = test_sandbox(
-            "sb-poll-service",
-            "poll-service",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-        let response = crate::grpc::OpenShellService::new(Arc::clone(&state))
-            .update_config(with_user(Request::new(waited_setting_update(
-                "poll-service",
-            ))))
-            .await
-            .expect("a waited update succeeds when completion is not tracked")
-            .into_inner();
-        assert!(response.operation.is_none());
-    }
-
-    #[tokio::test]
-    async fn push_mode_waited_update_finishes_for_a_legacy_supervisor() {
-        use openshell_core::proto::open_shell_server::OpenShell as _;
-
-        let mut state = test_server_state().await;
-        crate::grpc::test_support::enable_push_delivery(&mut state);
-        let sandbox = test_sandbox(
-            "sb-legacy-operation",
-            "legacy-operation",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-        // A supervisor without snapshot support is never registered with the
-        // delivery queue.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        state.supervisor_sessions.register(
-            "sb-legacy-operation".into(),
-            "session-1".into(),
-            tx,
-            tokio::sync::oneshot::channel().0,
-        );
-
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::grpc::OpenShellService::new(Arc::clone(&state)).update_config(with_user(
-                Request::new(waited_setting_update("legacy-operation")),
-            )),
-        )
-        .await
-        .expect("an untracked operation must not wait for its timeout")
-        .unwrap()
-        .into_inner();
-        assert!(response.operation.is_none());
     }
 
     #[tokio::test]
@@ -22962,9 +22643,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: current_version,
                 annotations: HashMap::new(),
-
-                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                wait_timeout: None,
             }),
         )
         .await
@@ -23064,9 +22742,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: current_version,
                 annotations: annotations.clone(),
-
-                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                wait_timeout: None,
             }),
         )
         .await
@@ -24121,9 +23796,6 @@ mod tests {
                 merge_operations: vec![],
                 expected_resource_version: 99, // stale version
                 annotations: HashMap::new(),
-
-                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                wait_timeout: None,
             }),
         )
         .await
@@ -24226,9 +23898,6 @@ mod tests {
                         merge_operations: vec![],
                         expected_resource_version: initial_version,
                         annotations: HashMap::new(),
-
-                        wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                        wait_timeout: None,
                     }),
                 )
                 .await
@@ -24605,228 +24274,6 @@ mod tests {
             response.is_ok(),
             "GetGatewayConfig must not require Platform Admin; got {:?}",
             response.unwrap_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn stopped_sandbox_setting_update_with_default_version_commits_with_annotations() {
-        let mut state = test_server_state().await;
-        crate::grpc::test_support::enable_push_delivery(&mut state);
-        let mut sandbox = test_sandbox(
-            "sb-inactive-operation",
-            "inactive-operation",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        sandbox.set_phase(openshell_core::proto::SandboxPhase::Stopped as i32);
-        state.store.put_message(&sandbox).await.unwrap();
-        let response = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                sandbox: "inactive-operation".to_string(),
-                setting_key: "ocsf_json_enabled".to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                expected_resource_version: 0,
-                annotations: HashMap::from([("change-ticket".to_string(), "1234".to_string())]),
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let operation = response.operation.expect("durable operation");
-        assert_eq!(
-            openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state).unwrap(),
-            openshell_core::proto::ConfigUpdateOperationState::Inactive
-        );
-        assert_eq!(response.settings_revision, 1);
-        assert_eq!(
-            response
-                .annotations
-                .get("change-ticket")
-                .map(String::as_str),
-            Some("1234")
-        );
-
-        let stored = load_sandbox_settings(&state.store, "default", "inactive-operation")
-            .await
-            .unwrap();
-        assert_eq!(
-            stored.settings.get("ocsf_json_enabled"),
-            Some(&StoredSettingValue::Bool(true))
-        );
-        let stored_sandbox = state
-            .store
-            .get_message_by_name::<Sandbox>("default", "inactive-operation")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored_sandbox
-                .metadata
-                .as_ref()
-                .unwrap()
-                .annotations
-                .get("change-ticket")
-                .map(String::as_str),
-            Some("1234")
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_operation_without_policy_history_applies_and_wakes_local_waiter() {
-        let mut state = test_server_state().await;
-        crate::grpc::test_support::enable_push_delivery(&mut state);
-        let sandbox = test_sandbox(
-            "sb-operation-wake",
-            "operation-wake",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-        let response = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                sandbox: sandbox.object_name().to_string(),
-                setting_key: "ocsf_json_enabled".to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let operation = response.operation.unwrap();
-        let operation_id = operation.operation_id.clone();
-        let snapshot = build_sandbox_config_snapshot(&state, &sandbox)
-            .await
-            .unwrap();
-        config_update_operation::associate_pending_with_snapshot(
-            &state,
-            sandbox.object_id(),
-            &snapshot,
-        )
-        .await
-        .unwrap();
-        let requested_revision = config_update_operation::get_record(&state, &operation_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation
-            .unwrap()
-            .target_revision
-            .unwrap();
-        let waiter_state = state.clone();
-        let waiter = tokio::spawn(async move {
-            config_update_operation::wait_for_terminal(
-                &waiter_state,
-                &operation_id,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-        });
-        tokio::task::yield_now().await;
-        config_update_operation::complete_from_apply_result(
-            &state,
-            sandbox.object_id(),
-            &ConfigComponentApplyResult {
-                component: ConfigComponent::SandboxConfig.into(),
-                requested_revision: Some(requested_revision),
-                outcome: ConfigApplyOutcome::Applied.into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let terminal = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
-            .await
-            .expect("terminal transition should notify the local waiter")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            openshell_core::proto::ConfigUpdateOperationState::try_from(terminal.state).unwrap(),
-            openshell_core::proto::ConfigUpdateOperationState::Applied
-        );
-    }
-
-    #[tokio::test]
-    async fn operation_waiter_recovers_when_notification_is_missed() {
-        let mut state = test_server_state().await;
-        crate::grpc::test_support::enable_push_delivery(&mut state);
-        let sandbox = test_sandbox(
-            "sb-operation-poll",
-            "operation-poll",
-            ProtoSandboxPolicy::default(),
-            Vec::new(),
-        );
-        state.store.put_message(&sandbox).await.unwrap();
-        state
-            .store
-            .put_policy_revision(
-                "operation-poll-policy",
-                sandbox.object_id(),
-                "default",
-                1,
-                &ProtoSandboxPolicy::default().encode_to_vec(),
-                "operation-poll-policy-hash",
-            )
-            .await
-            .unwrap();
-        let response = handle_update_config(
-            &state,
-            with_user(Request::new(UpdateConfigRequest {
-                sandbox: sandbox.object_name().to_string(),
-                setting_key: "ocsf_json_enabled".to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(true)),
-                }),
-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
-                wait_mode: ConfigUpdateWaitMode::CommitOnly.into(),
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let operation_id = response.operation.unwrap().operation_id;
-        let waiter_state = state.clone();
-        let waiter_operation_id = operation_id.clone();
-        let waiter = tokio::spawn(async move {
-            config_update_operation::wait_for_terminal(
-                &waiter_state,
-                &waiter_operation_id,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-        });
-        tokio::task::yield_now().await;
-        let mut record = config_update_operation::get_record(&state, &operation_id)
-            .await
-            .unwrap()
-            .unwrap();
-        record.operation.as_mut().unwrap().state =
-            openshell_core::proto::ConfigUpdateOperationState::Applied.into();
-        let resource_version = record.metadata.as_ref().unwrap().resource_version;
-        state
-            .store
-            .update_config_operation_cas(&record, resource_version)
-            .await
-            .unwrap();
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
-            .await
-            .expect("point polling should recover a missed notification")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            openshell_core::proto::ConfigUpdateOperationState::try_from(terminal.state).unwrap(),
-            openshell_core::proto::ConfigUpdateOperationState::Applied
         );
     }
 

@@ -498,7 +498,7 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
     let built =
         tokio::time::timeout(build_timeout(key.component), build_component(state, key)).await;
     let elapsed = started.elapsed();
-    let (message, require_acknowledgement, providers) = match built {
+    let (message, providers) = match built {
         Ok(Ok(Some(built))) => built,
         Ok(Ok(None)) => {
             record_build(key.component, *lane, "ok", elapsed);
@@ -519,12 +519,10 @@ async fn run_build(state: &Arc<ServerState>, ticket: &BuildTicket) -> BuildResul
     record_build(key.component, *lane, "ok", elapsed);
     let owner_moved = match owner_check(state, &key.sandbox_id, session_id).await {
         OwnerCheck::Current => {
-            let disposition = state.supervisor_sessions.deliver_config(
-                &key.sandbox_id,
-                session_id,
-                message,
-                require_acknowledgement,
-            );
+            let disposition =
+                state
+                    .supervisor_sessions
+                    .deliver_config(&key.sandbox_id, session_id, message);
             record_delivery(key.component, disposition.metric_label());
             false
         }
@@ -565,7 +563,7 @@ const fn build_timeout(component: ConfigComponentKind) -> Duration {
 async fn build_component(
     state: &Arc<ServerState>,
     key: &DeliveryKey,
-) -> Result<Option<(SupervisorConfigMessage, bool, HashSet<String>)>, Status> {
+) -> Result<Option<(SupervisorConfigMessage, HashSet<String>)>, Status> {
     let Some(sandbox) = state
         .store
         .get_message::<Sandbox>(&key.sandbox_id)
@@ -579,31 +577,15 @@ async fn build_component(
         .as_ref()
         .map(|spec| spec.providers.iter().cloned().collect())
         .unwrap_or_default();
-    let (message, require_acknowledgement) = match key.component {
-        ConfigComponentKind::SandboxConfig => {
-            let snapshot = build_sandbox_config_snapshot(state, &sandbox).await?;
-            // Bind pending operations to the exact snapshot about to be sent.
-            // A failure here fails the build, so delivery never outruns it.
-            let require_acknowledgement =
-                crate::config_update_operation::associate_pending_with_snapshot(
-                    state,
-                    &key.sandbox_id,
-                    &snapshot,
-                )
-                .await?;
-            (
-                SupervisorConfigMessage::SandboxConfig(Box::new(snapshot)),
-                require_acknowledgement,
-            )
-        }
-        ConfigComponentKind::ProviderEnvironment => (
-            SupervisorConfigMessage::ProviderEnvironment(
-                build_provider_environment_snapshot(state, &sandbox, true).await?,
-            ),
-            false,
+    let message = match key.component {
+        ConfigComponentKind::SandboxConfig => SupervisorConfigMessage::SandboxConfig(Box::new(
+            build_sandbox_config_snapshot(state, &sandbox).await?,
+        )),
+        ConfigComponentKind::ProviderEnvironment => SupervisorConfigMessage::ProviderEnvironment(
+            build_provider_environment_snapshot(state, &sandbox, true).await?,
         ),
     };
-    Ok(Some((message, require_acknowledgement, providers)))
+    Ok(Some((message, providers)))
 }
 
 enum OwnerCheck {
@@ -832,20 +814,6 @@ pub fn handle_peer_notify_config_update(
                     queue.publish_sandbox(&target.sandbox_id, components, Instant::now())
                 });
                 kick(state);
-                // A polling session is never registered, so no build reaches
-                // the operations a peer is reconciling.
-                let state = Arc::clone(state);
-                let sandbox_id = target.sandbox_id;
-                tokio::spawn(async move {
-                    if let Err(error) = crate::config_update_operation::finish_pending_if_polling(
-                        &state,
-                        &sandbox_id,
-                    )
-                    .await
-                    {
-                        warn!(sandbox_id, error = %error, "failed to finish configuration operations for a polling supervisor");
-                    }
-                });
             } else {
                 response.stale_owner = true;
             }

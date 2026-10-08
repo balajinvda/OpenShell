@@ -20,9 +20,6 @@ import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
 import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
 import {
-  ConfigApplyOutcome,
-  ConfigUpdateOperationState,
-  ConfigUpdateWaitMode,
   type ExecSandboxInputSchema,
   OpenShell,
   ServiceAuthorizationMode as ProtoServiceAuthorizationMode,
@@ -454,14 +451,9 @@ export interface SandboxConfig {
 export interface SetPolicyOptions extends SandboxWorkspaceOptions {
   /** Pin the sandbox resource version for optimistic concurrency (u64 as string). */
   expectedResourceVersion?: string;
-  /**
-   * Ask the gateway to wait for a durable terminal apply result. Gateways that
-   * do not track completion, such as those that keep configuration polling,
-   * return the committed result without an operation; the client then polls
-   * getConfig until the applied policy hash is observed.
-   */
+  /** Poll getConfig until the applied policy hash is observed. */
   wait?: boolean;
-  /** Bound the server-side wait, or the client-side poll fallback, in seconds. Default 60. */
+  /** Bound the `wait` poll (seconds). Default 60. */
   waitTimeoutSecs?: number;
 }
 
@@ -471,20 +463,6 @@ export interface UpdateConfigResult {
   /** u64 rendered as a string. */
   settingsRevision: string;
   deleted: boolean;
-  operationId?: string;
-  operationState?: 'unspecified' | 'pending' | 'applied' | 'inactive' | 'failed' | 'superseded' | 'cancelled';
-  /** Application may complete with a degraded outcome. */
-  operationOutcome?:
-    | 'unspecified'
-    | 'applied'
-    | 'ignored_duplicate'
-    | 'ignored_stale'
-    | 'retained_local_override'
-    | 'degraded'
-    | 'failed_retained_last_known_good'
-    | 'failed_closed'
-    | 'unsupported';
-  operationError?: string;
 }
 
 // ---- enum → lowercase string -----------------------------------------------
@@ -621,16 +599,6 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
-    ...(resp.operation
-      ? {
-          operationId: resp.operation.operationId,
-          operationState: (ConfigUpdateOperationState[resp.operation.state]?.toLowerCase() ??
-            'unspecified') as UpdateConfigResult['operationState'],
-          operationOutcome: (ConfigApplyOutcome[resp.operation.outcome]?.toLowerCase() ??
-            'unspecified') as UpdateConfigResult['operationOutcome'],
-          operationError: resp.operation.sanitizedError,
-        }
-      : {}),
   };
 }
 
@@ -1758,10 +1726,8 @@ export class SandboxClient {
 
   // Update the sandbox-scoped policy. Sandbox scope (global=false) may only
   // change network_policies; static fields must match the create-time policy or
-  // the gateway rejects the update. With `wait`, the gateway owns the durable
-  // wait and returns only after a terminal apply result. A gateway that returns
-  // no operation does not track completion; poll getConfig for the applied
-  // policy hash instead.
+  // the gateway rejects the update. With `wait`, poll getConfig until the
+  // applied policy hash is observed.
   async setPolicy(
     name: string,
     policy: MessageInitShape<typeof SandboxPolicySchema>,
@@ -1773,27 +1739,10 @@ export class SandboxClient {
         policy,
         global: false,
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
-        waitMode: options?.wait ? ConfigUpdateWaitMode.WAIT_FOR_COMPLETION : ConfigUpdateWaitMode.COMMIT_ONLY,
-        waitTimeout: durationFromMs(Math.max(0, (options?.waitTimeoutSecs ?? 60) * 1000)),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait && !resp.operation) {
+      if (options?.wait)
         await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs, options.workspace);
-      } else if (options?.wait && resp.operation) {
-        if (
-          resp.operation.state === ConfigUpdateOperationState.FAILED ||
-          resp.operation.state === ConfigUpdateOperationState.SUPERSEDED ||
-          resp.operation.state === ConfigUpdateOperationState.CANCELLED
-        ) {
-          throw new SdkError(
-            'rpc',
-            `policy update operation '${resp.operation.operationId}' did not apply: ${resp.operation.sanitizedError}`,
-          );
-        }
-        if (![ConfigUpdateOperationState.APPLIED, ConfigUpdateOperationState.INACTIVE].includes(resp.operation.state)) {
-          throw new SdkError('rpc', `gateway returned non-terminal operation '${resp.operation.operationId}'`);
-        }
-      }
       return result;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);

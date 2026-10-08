@@ -2369,20 +2369,6 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         .replay_pending_relays(&sandbox_id, &session_id, &session_tx)
         .await;
 
-    // Operations committed before a polling supervisor connected can never
-    // receive its apply result.
-    if crate::config_delivery::push_enabled(&state) && !stream_applies_config {
-        let state = Arc::clone(&state);
-        let sandbox_id = sandbox_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                crate::config_update_operation::finish_pending_if_polling(&state, &sandbox_id).await
-            {
-                warn!(sandbox_id, error = %error, "failed to finish configuration operations for a polling supervisor");
-            }
-        });
-    }
-
     if let Some(setup) = config_push {
         crate::config_delivery::register_session(
             &state,

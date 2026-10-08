@@ -7,10 +7,6 @@
 
 mod helpers;
 
-use openshell_core::proto::{
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-};
-
 use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -23,7 +19,8 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
@@ -594,17 +591,6 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
     ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
-    }
-
-    #[allow(unused_qualifications)]
-    async fn get_config_update_operation(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetConfigUpdateOperationRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::GetConfigUpdateOperationResponse>,
-        tonic::Status,
-    > {
-        Err(tonic::Status::unimplemented("unused"))
     }
 
     async fn update_config(

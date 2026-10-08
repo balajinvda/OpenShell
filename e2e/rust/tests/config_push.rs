@@ -4,11 +4,9 @@
 //! E2E tests for configuration delivered over the supervisor session.
 //!
 //! Runs only in the `e2e:rust:push` lane, where the gateway starts with
-//! `config_delivery_mode = "push"`. In that mode `policy set --wait` returns
-//! after the supervisor acknowledges the exact revision on its session, and the
-//! CLI reports the durable operation that tracked it. Polling gateways never
-//! return an operation, so these assertions fail if the lane silently falls
-//! back to polling.
+//! `config_delivery_mode = "push"`. Only a supervisor that receives its
+//! bootstrap over the session logs loading it, so these tests fail if the lane
+//! silently falls back to polling.
 
 #![cfg(feature = "e2e-config-push")]
 
@@ -91,11 +89,25 @@ async fn policy_version(sandbox: &str) -> u32 {
         .unwrap_or_else(|| panic!("no policy version in:\n{}", result.output))
 }
 
-/// Returns the operation id from the CLI's
-/// "Policy version N applied (operation <id>)" line.
-fn applied_operation(output: &str) -> Option<&str> {
-    let (_, rest) = output.split_once("applied (operation ")?;
-    rest.split_once(')').map(|(operation, _)| operation)
+/// Wait until the sandbox's supervisor reports loading a pushed bootstrap.
+async fn assert_push_session(sandbox: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let logs = run_cli(&["logs", sandbox, "-n", "500", "--source", "sandbox"]).await;
+        if logs.success
+            && logs
+                .output
+                .contains("Loading sandbox policy from supervisor bootstrap")
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "supervisor never reported a pushed-configuration session; is the gateway in push mode?\n{}",
+            logs.output
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 async fn set_policy_and_wait(sandbox: &str, policy: &NamedTempFile) {
@@ -116,17 +128,12 @@ async fn set_policy_and_wait(sandbox: &str, policy: &NamedTempFile) {
         "policy set --wait failed:\n{}",
         result.output
     );
-    assert!(
-        applied_operation(&result.output).is_some_and(|operation| !operation.is_empty()),
-        "policy set --wait returned without an applied operation; is the gateway in push mode?\n{}",
-        result.output
-    );
 }
 
 /// A live policy change reaches the supervisor over its session, and the wait
-/// completes from the supervisor's acknowledgement of that exact revision.
+/// completes once the supervisor reports that exact revision loaded.
 #[tokio::test]
-async fn streamed_policy_update_completes_its_operation() {
+async fn streamed_policy_update_reaches_the_supervisor() {
     let base = write_policy("");
     let mut guard = SandboxGuard::create_keep_with_args(
         &[
@@ -139,6 +146,7 @@ async fn streamed_policy_update_completes_its_operation() {
     )
     .await
     .expect("create sandbox");
+    assert_push_session(&guard.name).await;
     let initial_version = policy_version(&guard.name).await;
 
     let updated = write_policy(NETWORK_RULE);
@@ -157,9 +165,7 @@ async fn streamed_policy_update_completes_its_operation() {
         list.output
     );
 
-    // Resubmitting the effective policy creates no revision. The gateway still
-    // waits for the supervisor to confirm the revision it already runs, so a
-    // stuck unchanged-request operation fails this call by timing out.
+    // Resubmitting the effective policy creates no revision.
     let path = updated.path().to_str().expect("UTF-8 policy path");
     let unchanged = run_cli(&[
         "policy",

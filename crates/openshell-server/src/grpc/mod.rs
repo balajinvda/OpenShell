@@ -33,12 +33,11 @@ use openshell_core::proto::{
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, ExtensionKind,
     FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse, GatewayMessage,
-    GetConfigUpdateOperationRequest, GetConfigUpdateOperationResponse, GetCurrentUserRequest,
-    GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
-    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetGatewayInfoRequest, GetGatewayInfoResponse, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     GetSandboxProviderStatusRequest, GetSandboxProviderStatusResponse, GetSandboxRequest,
@@ -99,9 +98,6 @@ pub fn persistence_error_to_status(
             ),
             current_resource_version,
         ),
-        PersistenceError::SandboxDeleting => {
-            Status::failed_precondition(format!("{operation} failed: sandbox is being deleted"))
-        }
         other => Status::internal(format!("{operation} failed: {other}")),
     }
 }
@@ -624,6 +620,13 @@ impl OpenShell for OpenShellService {
         policy::handle_get_gateway_config(&self.state, request).await
     }
 
+    async fn get_sandbox_provider_environment(
+        &self,
+        request: Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        policy::handle_get_sandbox_provider_environment(&self.state, request).await
+    }
+
     async fn exchange_provider_subject_token(
         &self,
         request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -635,48 +638,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let wait_mode =
-            openshell_core::proto::ConfigUpdateWaitMode::try_from(request.get_ref().wait_mode)
-                .map_err(|_| Status::invalid_argument("unknown configuration update wait mode"))?;
-        let wait = wait_mode == openshell_core::proto::ConfigUpdateWaitMode::WaitForCompletion;
-        if wait && request.get_ref().global {
-            return Err(Status::invalid_argument(
-                "WAIT_FOR_COMPLETION is only supported for sandbox-scoped updates",
-            ));
-        }
-        let timeout = policy::config_wait_timeout(request.get_ref().wait_timeout.as_ref())?;
-        let mut response = mutation_replay::run(&self.state, request).await?;
-        // A response without an operation means completion is not tracked,
-        // for example because the gateway keeps configuration polling. Clients
-        // then confirm application through policy status.
-        if wait
-            && let Some(id) = response
-                .get_ref()
-                .operation
-                .as_ref()
-                .map(|operation| operation.operation_id.clone())
-        {
-            let operation =
-                crate::config_update_operation::wait_for_terminal(&self.state, &id, timeout)
-                    .await?;
-            response.get_mut().operation =
-                (!crate::config_update_operation::is_untracked(&operation)).then_some(operation);
-        }
-        Ok(response)
-    }
-
-    async fn get_config_update_operation(
-        &self,
-        request: Request<GetConfigUpdateOperationRequest>,
-    ) -> Result<Response<GetConfigUpdateOperationResponse>, Status> {
-        policy::handle_get_config_update_operation(&self.state, request).await
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        request: Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        policy::handle_get_sandbox_provider_environment(&self.state, request).await
+        mutation_replay::run(&self.state, request).await
     }
 
     async fn get_sandbox_policy_status(

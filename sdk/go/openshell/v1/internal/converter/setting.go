@@ -6,9 +6,6 @@ package converter
 import (
 	"fmt"
 	"slices"
-	"time"
-
-	"google.golang.org/protobuf/types/known/durationpb"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -190,13 +187,6 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		Global:                  cu.Global,
 		ExpectedResourceVersion: cu.ExpectedResourceVersion,
 		Annotations:             CopyStringMap(cu.Annotations),
-		WaitTimeout:             durationpb.New(time.Duration(cu.WaitTimeoutSeconds) * time.Second),
-	}
-	switch cu.WaitMode {
-	case v1.ConfigUpdateWaitForCompletion:
-		req.WaitMode = pb.ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_WAIT_FOR_COMPLETION
-	case v1.ConfigUpdateCommitOnly:
-		req.WaitMode = pb.ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_COMMIT_ONLY
 	}
 	if !cu.Global {
 		req.Sandbox = cu.Name
@@ -334,21 +324,11 @@ func ConfigUpdateResultFromProto(resp *pb.UpdateConfigResponse) *v1.ConfigUpdate
 	if resp == nil {
 		return nil
 	}
-	result := &v1.ConfigUpdateResult{
+	return &v1.ConfigUpdateResult{
 		Version:          resp.GetVersion(),
 		PolicyHash:       resp.GetPolicyHash(),
 		SettingsRevision: resp.GetSettingsRevision(),
 		Deleted:          resp.GetDeleted(),
 		Annotations:      CopyStringMap(resp.GetAnnotations()),
 	}
-	if operation := resp.GetOperation(); operation != nil {
-		result.Operation = &v1.ConfigUpdateOperation{
-			OperationID:    operation.GetOperationId(),
-			SandboxID:      operation.GetSandboxId(),
-			State:          operation.GetState().String(),
-			Outcome:        operation.GetOutcome().String(),
-			SanitizedError: operation.GetSanitizedError(),
-		}
-	}
-	return result
 }
