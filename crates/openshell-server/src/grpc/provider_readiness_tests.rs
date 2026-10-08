@@ -70,7 +70,6 @@ fn hello() -> SupervisorHello {
     SupervisorHello {
         sandbox_id: Uuid::new_v4().to_string(),
         instance_id: Uuid::new_v4().to_string(),
-        supports_config_snapshots: true,
         connection_epoch: 0,
         supports_provider_readiness: true,
         image_policy_discovery: None,

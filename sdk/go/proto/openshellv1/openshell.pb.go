@@ -436,6 +436,9 @@ const (
 	ConfigApplyOutcome_CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD ConfigApplyOutcome = 6
 	ConfigApplyOutcome_CONFIG_APPLY_OUTCOME_FAILED_CLOSED                   ConfigApplyOutcome = 7
 	ConfigApplyOutcome_CONFIG_APPLY_OUTCOME_UNSUPPORTED                     ConfigApplyOutcome = 8
+	// The supervisor holds the snapshot until the matching snapshot of the other
+	// component arrives. Not terminal: it never completes an operation.
+	ConfigApplyOutcome_CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT ConfigApplyOutcome = 9
 )
 
 // Enum value maps for ConfigApplyOutcome.
@@ -450,6 +453,7 @@ var (
 		6: "CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD",
 		7: "CONFIG_APPLY_OUTCOME_FAILED_CLOSED",
 		8: "CONFIG_APPLY_OUTCOME_UNSUPPORTED",
+		9: "CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT",
 	}
 	ConfigApplyOutcome_value = map[string]int32{
 		"CONFIG_APPLY_OUTCOME_UNSPECIFIED":                     0,
@@ -461,6 +465,7 @@ var (
 		"CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD": 6,
 		"CONFIG_APPLY_OUTCOME_FAILED_CLOSED":                   7,
 		"CONFIG_APPLY_OUTCOME_UNSUPPORTED":                     8,
+		"CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT":              9,
 	}
 )
 
@@ -11767,8 +11772,10 @@ type UpdateConfigRequest struct {
 	WaitMode ConfigUpdateWaitMode `protobuf:"varint,12,opt,name=wait_mode,json=waitMode,proto3,enum=openshell.v1.ConfigUpdateWaitMode" json:"wait_mode,omitempty"`
 	// Optional retry key scoped to the sandbox. Reusing a key returns the
 	// original operation and never creates another desired-state revision.
-	IdempotencyKey string               `protobuf:"bytes,13,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	WaitTimeout    *durationpb.Duration `protobuf:"bytes,114,opt,name=wait_timeout,json=waitTimeout,proto3" json:"wait_timeout,omitempty"`
+	IdempotencyKey string `protobuf:"bytes,13,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	// Server-side wait bound for WAIT_FOR_COMPLETION. Zero uses 60 seconds. The
+	// operation remains durable and may complete after this RPC times out.
+	WaitTimeout *durationpb.Duration `protobuf:"bytes,14,opt,name=wait_timeout,json=waitTimeout,proto3" json:"wait_timeout,omitempty"`
 	// Required for sandbox-scoped updates and empty for global updates.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
@@ -13992,16 +13999,14 @@ type SupervisorHello struct {
 	// The supervisor understands SessionRedirect. Gateways never redirect a
 	// supervisor that does not set this.
 	SupportsSessionRedirect bool `protobuf:"varint,6,opt,name=supports_session_redirect,json=supportsSessionRedirect,proto3" json:"supports_session_redirect,omitempty"`
-	// The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
-	// stream. Gateways send configuration payloads only when this is set.
-	SupportsConfigSnapshots bool `protobuf:"varint,7,opt,name=supports_config_snapshots,json=supportsConfigSnapshots,proto3" json:"supports_config_snapshots,omitempty"`
 	// Explicit result of inspecting the workload image policy, sent only on the
 	// first connection of a supervisor process. The gateway considers it when
 	// preparing the first authoritative bootstrap for this process.
 	ImagePolicyDiscovery *ImagePolicyDiscovery `protobuf:"bytes,8,opt,name=image_policy_discovery,json=imagePolicyDiscovery,proto3" json:"image_policy_discovery,omitempty"`
-	// The supervisor applies streamed configuration, reports apply results and
-	// admission, and prepares its startup policy on this stream. Requires
-	// supports_config_snapshots.
+	// The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
+	// stream, applies them, reports apply results and admission, and prepares
+	// its startup policy on this stream. Gateways send configuration payloads
+	// only when this is set.
 	SupportsConfigApply bool `protobuf:"varint,9,opt,name=supports_config_apply,json=supportsConfigApply,proto3" json:"supports_config_apply,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -14075,13 +14080,6 @@ func (x *SupervisorHello) GetRedirected() bool {
 func (x *SupervisorHello) GetSupportsSessionRedirect() bool {
 	if x != nil {
 		return x.SupportsSessionRedirect
-	}
-	return false
-}
-
-func (x *SupervisorHello) GetSupportsConfigSnapshots() bool {
-	if x != nil {
-		return x.SupportsConfigSnapshots
 	}
 	return false
 }
@@ -14393,10 +14391,8 @@ type SessionAccepted struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Gateway-assigned session ID for this connection.
 	SessionId string `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	// Complete gateway-owned configuration. Sent only to supervisors that set
-	// SupervisorHello.supports_config_snapshots. During the staged rollout this
-	// may also be omitted when push delivery is disabled or the gateway cannot
-	// build the projection.
+	// Complete gateway-owned configuration. Present exactly when
+	// config_apply_enabled is set.
 	Bootstrap *ConfigBootstrap `protobuf:"bytes,3,opt,name=bootstrap,proto3" json:"bootstrap,omitempty"`
 	// The gateway delivers configuration authoritatively on this stream: the
 	// bootstrap is required, ConfigUpdate payloads are applied and
@@ -20460,7 +20456,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rexpires_after\x18f \x01(\v2\x19.google.protobuf.DurationR\fexpiresAfter\x12\x1d\n" +
 	"\n" +
 	"token_type\x18\x03 \x01(\tR\ttokenTypeJ\x04\b\x02\x10\x03R\n" +
-	"expires_in\"\xea\x06\n" +
+	"expires_in\"\xd1\x06\n" +
 	"\x13UpdateConfigRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\n" +
 	" \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12;\n" +
@@ -20475,13 +20471,13 @@ const file_openshell_proto_rawDesc = "" +
 	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12?\n" +
 	"\twait_mode\x18\f \x01(\x0e2\".openshell.v1.ConfigUpdateWaitModeR\bwaitMode\x12'\n" +
 	"\x0fidempotency_key\x18\r \x01(\tR\x0eidempotencyKey\x12<\n" +
-	"\fwait_timeout\x18r \x01(\v2\x19.google.protobuf.DurationR\vwaitTimeout\x12\x18\n" +
+	"\fwait_timeout\x18\x0e \x01(\v2\x19.google.protobuf.DurationR\vwaitTimeout\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\v \x01(\tR\trequestId\x1a>\n" +
 	"\x10AnnotationsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x0e\x10\x0fR\x11wait_timeout_secs\"\x98\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x98\x01\n" +
 	"\x1fGetConfigUpdateOperationRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x02 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12!\n" +
 	"\foperation_id\x18\x01 \x01(\tR\voperationId\"e\n" +
@@ -20635,7 +20631,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rconfig_update\x18\a \x01(\v2\x1a.openshell.v1.ConfigUpdateH\x00R\fconfigUpdate\x12`\n" +
 	"\x18startup_config_candidate\x18\b \x01(\v2$.openshell.v1.StartupConfigCandidateH\x00R\x16startupConfigCandidate\x12f\n" +
 	"\x17configuration_admission\x18\t \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionH\x00R\x16configurationAdmissionB\t\n" +
-	"\apayload\"\xe2\x03\n" +
+	"\apayload\"\xa6\x03\n" +
 	"\x0fSupervisorHello\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -20646,8 +20642,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"redirected\x18\x05 \x01(\bR\n" +
 	"redirected\x12:\n" +
-	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x12:\n" +
-	"\x19supports_config_snapshots\x18\a \x01(\bR\x17supportsConfigSnapshots\x12X\n" +
+	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x12X\n" +
 	"\x16image_policy_discovery\x18\b \x01(\v2\".openshell.v1.ImagePolicyDiscoveryR\x14imagePolicyDiscovery\x122\n" +
 	"\x15supports_config_apply\x18\t \x01(\bR\x13supportsConfigApply\"\xc7\x01\n" +
 	"\x14ImagePolicyDiscovery\x122\n" +
@@ -21110,7 +21105,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fConfigComponent\x12 \n" +
 	"\x1cCONFIG_COMPONENT_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fCONFIG_COMPONENT_SANDBOX_CONFIG\x10\x01\x12)\n" +
-	"%CONFIG_COMPONENT_PROVIDER_ENVIRONMENT\x10\x02*\x8d\x03\n" +
+	"%CONFIG_COMPONENT_PROVIDER_ENVIRONMENT\x10\x02*\xba\x03\n" +
 	"\x12ConfigApplyOutcome\x12$\n" +
 	" CONFIG_APPLY_OUTCOME_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cCONFIG_APPLY_OUTCOME_APPLIED\x10\x01\x12*\n" +
@@ -21120,7 +21115,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1dCONFIG_APPLY_OUTCOME_DEGRADED\x10\x05\x128\n" +
 	"4CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD\x10\x06\x12&\n" +
 	"\"CONFIG_APPLY_OUTCOME_FAILED_CLOSED\x10\a\x12$\n" +
-	" CONFIG_APPLY_OUTCOME_UNSUPPORTED\x10\b*\xd2\x02\n" +
+	" CONFIG_APPLY_OUTCOME_UNSUPPORTED\x10\b\x12+\n" +
+	"'CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT\x10\t*\xd2\x02\n" +
 	"\x1aConfigUpdateOperationState\x12-\n" +
 	")CONFIG_UPDATE_OPERATION_STATE_UNSPECIFIED\x10\x00\x12)\n" +
 	"%CONFIG_UPDATE_OPERATION_STATE_PENDING\x10\x01\x12)\n" +

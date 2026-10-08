@@ -1626,6 +1626,9 @@ enum ConfigApplyOutcome {
   CONFIG_APPLY_OUTCOME_FAILED_RETAINED_LAST_KNOWN_GOOD = 6;
   CONFIG_APPLY_OUTCOME_FAILED_CLOSED = 7;
   CONFIG_APPLY_OUTCOME_UNSUPPORTED = 8;
+  // The supervisor holds the snapshot until the matching snapshot of the other
+  // component arrives. Not terminal: it never completes an operation.
+  CONFIG_APPLY_OUTCOME_AWAITING_COMPONENT = 9;
 }
 
 // Durable lifecycle of one desired-state update operation.
@@ -2796,9 +2799,7 @@ message UpdateConfigRequest {
   string idempotency_key = 13;
   // Server-side wait bound for WAIT_FOR_COMPLETION. Zero uses 60 seconds. The
   // operation remains durable and may complete after this RPC times out.
-  reserved 14;
-  reserved "wait_timeout_secs";
-  google.protobuf.Duration wait_timeout = 114;
+  google.protobuf.Duration wait_timeout = 14;
   // Required for sandbox-scoped updates and empty for global updates.
   string sandbox = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
@@ -3125,16 +3126,14 @@ message SupervisorHello {
   // The supervisor understands SessionRedirect. Gateways never redirect a
   // supervisor that does not set this.
   bool supports_session_redirect = 6;
-  // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
-  // stream. Gateways send configuration payloads only when this is set.
-  bool supports_config_snapshots = 7;
   // Explicit result of inspecting the workload image policy, sent only on the
   // first connection of a supervisor process. The gateway considers it when
   // preparing the first authoritative bootstrap for this process.
   ImagePolicyDiscovery image_policy_discovery = 8;
-  // The supervisor applies streamed configuration, reports apply results and
-  // admission, and prepares its startup policy on this stream. Requires
-  // supports_config_snapshots.
+  // The supervisor accepts ConfigBootstrap and ConfigUpdate payloads on this
+  // stream, applies them, reports apply results and admission, and prepares
+  // its startup policy on this stream. Gateways send configuration payloads
+  // only when this is set.
   bool supports_config_apply = 9;
 }
 
@@ -3177,10 +3176,8 @@ message SessionAccepted {
   reserved "heartbeat_interval_secs";
   // Gateway-assigned session ID for this connection.
   string session_id = 1;
-  // Complete gateway-owned configuration. Sent only to supervisors that set
-  // SupervisorHello.supports_config_snapshots. During the staged rollout this
-  // may also be omitted when push delivery is disabled or the gateway cannot
-  // build the projection.
+  // Complete gateway-owned configuration. Present exactly when
+  // config_apply_enabled is set.
   ConfigBootstrap bootstrap = 3;
   // The gateway delivers configuration authoritatively on this stream: the
   // bootstrap is required, ConfigUpdate payloads are applied and

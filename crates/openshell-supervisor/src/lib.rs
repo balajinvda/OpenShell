@@ -4593,15 +4593,18 @@ impl StreamConfigurationState {
 fn stream_generation_pending_result(
     component: openshell_core::proto::ConfigComponent,
     requested_revision: openshell_core::proto::ConfigSnapshotRevision,
-    message: impl Into<String>,
 ) -> openshell_core::proto::ConfigComponentApplyResult {
     config_apply_result(
         component,
         requested_revision,
         None,
-        openshell_core::proto::ConfigApplyOutcome::FailedClosed,
-        Some(("generation_mismatch", message.into(), true)),
+        openshell_core::proto::ConfigApplyOutcome::AwaitingComponent,
+        None,
     )
+}
+
+fn is_awaiting_component(result: &openshell_core::proto::ConfigComponentApplyResult) -> bool {
+    result.outcome == i32::from(openshell_core::proto::ConfigApplyOutcome::AwaitingComponent)
 }
 
 fn stage_stream_provider_snapshot(
@@ -4661,11 +4664,9 @@ fn stage_stream_provider_snapshot(
         credentials,
         expires_at_ms,
     });
-    stream_generation_pending_result(
-        ConfigComponent::ProviderEnvironment,
-        requested_revision,
-        "provider environment is waiting for its matching admitted sandbox configuration",
-    )
+    // The provider environment waits for its matching admitted sandbox
+    // configuration.
+    stream_generation_pending_result(ConfigComponent::ProviderEnvironment, requested_revision)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4737,10 +4738,7 @@ async fn apply_stream_config_request<C: PolicyGatewayClient>(
                 admission.state
                     == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
             }) && stream_state.pending_provider.is_none()
-                && provider_result
-                    .failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.code == "generation_mismatch")
+                && is_awaiting_component(provider_result)
             {
                 let requested_revision = provider_result
                     .requested_revision
@@ -4789,10 +4787,7 @@ async fn apply_stream_config_request<C: PolicyGatewayClient>(
                 Some(config_update::Component::ProviderEnvironment(snapshot)) => {
                     let mut provider_result =
                         stage_stream_provider_snapshot(snapshot, stream_state);
-                    if provider_result
-                        .failure
-                        .as_ref()
-                        .is_some_and(|failure| failure.code == "generation_mismatch")
+                    if is_awaiting_component(&provider_result)
                         && let Some(pending_sandbox) = stream_state.pending_sandbox.take()
                     {
                         let sandbox_result = apply_stream_sandbox_snapshot(
@@ -4983,10 +4978,10 @@ async fn apply_stream_sandbox_snapshot<C: PolicyGatewayClient>(
             .is_none_or(|provider| provider.identity != desired_environment)
     {
         stream_state.pending_sandbox = Some(Box::new(snapshot));
+        // The sandbox configuration waits for its matching provider environment.
         return stream_generation_pending_result(
             ConfigComponent::SandboxConfig,
             requested_revision,
-            "sandbox configuration is waiting for its matching provider environment",
         );
     }
 
@@ -11228,11 +11223,9 @@ network_policies:
 
         assert_eq!(
             openshell_core::proto::ConfigApplyOutcome::try_from(result.outcome).unwrap(),
-            openshell_core::proto::ConfigApplyOutcome::FailedClosed
+            openshell_core::proto::ConfigApplyOutcome::AwaitingComponent
         );
-        let failure = result.failure.as_ref().expect("transient mismatch failure");
-        assert_eq!(failure.code, "generation_mismatch");
-        assert!(failure.retryable);
+        assert!(result.failure.is_none());
         assert_eq!(ctx.provider_credentials.snapshot().revision, 0);
         assert!(
             !ctx.provider_credentials
@@ -11422,14 +11415,9 @@ network_policies:
         .await;
         assert_eq!(
             ConfigApplyOutcome::try_from(waiting.outcome).unwrap(),
-            ConfigApplyOutcome::FailedClosed
+            ConfigApplyOutcome::AwaitingComponent
         );
-        let failure = waiting
-            .failure
-            .as_ref()
-            .expect("transient mismatch failure");
-        assert_eq!(failure.code, "generation_mismatch");
-        assert!(failure.retryable);
+        assert!(waiting.failure.is_none());
         assert!(stream_state.pending_sandbox.is_some());
         assert_eq!(ctx.provider_credentials.snapshot().revision, 0);
 

@@ -659,9 +659,9 @@ fn validate_component_apply_result(
         ConfigApplyOutcome::Applied
         | ConfigApplyOutcome::IgnoredDuplicate
         | ConfigApplyOutcome::Degraded => applied_matches_request,
-        ConfigApplyOutcome::RetainedLocalOverride | ConfigApplyOutcome::FailedClosed => {
-            applied_is_absent
-        }
+        ConfigApplyOutcome::RetainedLocalOverride
+        | ConfigApplyOutcome::FailedClosed
+        | ConfigApplyOutcome::AwaitingComponent => applied_is_absent,
         ConfigApplyOutcome::FailedRetainedLastKnownGood => {
             result.applied_revision.is_some() && !applied_matches_request
         }
@@ -687,10 +687,7 @@ fn outcome_acknowledges_revision(outcome: ConfigApplyOutcome) -> bool {
 }
 
 fn generation_is_pending(result: &ConfigComponentApplyResult) -> bool {
-    result
-        .failure
-        .as_ref()
-        .is_some_and(|failure| failure.retryable && failure.code == "generation_mismatch")
+    result.outcome == i32::from(ConfigApplyOutcome::AwaitingComponent)
 }
 
 impl SupervisorSessionRegistry {
@@ -3189,12 +3186,10 @@ pub async fn handle_connect_supervisor(
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
     // Configuration is pushed only in push mode and only to supervisors that
-    // advertise snapshot support. Of those, supervisors that also apply
-    // snapshots receive authoritative delivery; the rest keep polling.
-    let config_push_enabled = state.config.config_delivery_mode
+    // apply it; the rest keep polling.
+    let stream_applies_config = state.config.config_delivery_mode
         == openshell_core::config::ConfigDeliveryMode::Push
-        && hello.supports_config_snapshots;
-    let stream_applies_config = config_push_enabled && hello.supports_config_apply;
+        && hello.supports_config_apply;
     // The stock supervisor includes discovery only on its first connection.
     // Reconnects from the same process omit it and proceed directly to the
     // current authoritative bootstrap.
@@ -3213,7 +3208,7 @@ pub async fn handle_connect_supervisor(
     };
     // Captured before reading any bootstrap input, including the sandbox
     // record, so registration detects publications the bootstrap may miss.
-    let captured_seq = config_push_enabled.then(|| state.config_delivery.current_seq());
+    let captured_seq = stream_applies_config.then(|| state.config_delivery.current_seq());
     let sandbox = require_persisted_sandbox(&state.store, &sandbox_id).await?;
     // Validate readiness identities before replacing a healthy session.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
@@ -4211,7 +4206,8 @@ async fn record_config_component_observation(
             | ConfigApplyOutcome::Applied
             | ConfigApplyOutcome::IgnoredDuplicate
             | ConfigApplyOutcome::IgnoredStale
-            | ConfigApplyOutcome::Unsupported => "gateway",
+            | ConfigApplyOutcome::Unsupported
+            | ConfigApplyOutcome::AwaitingComponent => "gateway",
         }
         .to_string(),
         observed_at_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
@@ -7059,7 +7055,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_pending_result_schedules_reconciliation_without_persistence() {
-        use openshell_core::proto::{ConfigApplyFailure, ConfigurationAdmissionState};
+        use openshell_core::proto::ConfigurationAdmissionState;
 
         let sandbox_id = "sb-generation-pending-retry";
         let state = push_state_with_sandbox(sandbox_id).await;
@@ -7138,12 +7134,8 @@ mod tests {
                             component: ConfigComponent::SandboxConfig.into(),
                             requested_revision: Some(revision),
                             applied_revision: None,
-                            outcome: ConfigApplyOutcome::FailedClosed.into(),
-                            failure: Some(ConfigApplyFailure {
-                                code: "generation_mismatch".into(),
-                                message: "waiting for matching provider generation".into(),
-                                retryable: true,
-                            }),
+                            outcome: ConfigApplyOutcome::AwaitingComponent.into(),
+                            failure: None,
                         }),
                         admission: Some(rejected_admission),
                     },

@@ -871,6 +871,8 @@ pub async fn complete_from_apply_results(
                 | ConfigApplyOutcome::FailedClosed
                 | ConfigApplyOutcome::Unsupported
                 | ConfigApplyOutcome::Unspecified => ConfigUpdateOperationState::Failed,
+                // Not terminal; the matching component completes the operation.
+                ConfigApplyOutcome::AwaitingComponent => continue,
             };
             let failure = result
                 .failure

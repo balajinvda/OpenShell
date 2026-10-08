@@ -825,7 +825,6 @@ async fn open_session(
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.clone(),
             instance_id: instance_id.clone(),
-            supports_config_snapshots: true,
             supports_config_apply: true,
             connection_epoch,
             image_policy_discovery,

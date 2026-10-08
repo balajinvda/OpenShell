@@ -233,10 +233,12 @@ mod tests {
     // decoding or deadline updates cannot claim an existing attempt.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
+    // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
+    // stored operations but never recorded on one: it is not terminal.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "c628cc935f0f8b41a9bfeea2342cde6f4e0da9a58bdaf96d533606ff3d6309a7";
+        "22be3261c1f0b4059f905955b73ea6048e407e8108f894097cf8b873c16c0fdb";
     const DURABLE_SCHEMA_SHA256: &str =
-        "947396e9e9f73b8e2971e923137eea4b9d5bdc4f67d88db6237c358756ffd8a8";
+        "fc80b20dba6ca8ba69f16d96d75b8788c9f660ec66c56af15124fb1b0c514b1f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;

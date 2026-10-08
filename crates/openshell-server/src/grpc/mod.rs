@@ -1147,7 +1147,6 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_snapshots: features != StreamFeatures::Legacy,
                     supports_config_apply: features == StreamFeatures::Apply,
                     connection_epoch: 0,
                     image_policy_discovery,
