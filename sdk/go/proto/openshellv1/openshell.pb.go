@@ -503,10 +503,13 @@ const (
 	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_UNSPECIFIED ConfigUpdateOperationState = 0
 	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_PENDING     ConfigUpdateOperationState = 1
 	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_APPLIED     ConfigUpdateOperationState = 2
-	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_INACTIVE    ConfigUpdateOperationState = 3
-	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_FAILED      ConfigUpdateOperationState = 4
-	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_SUPERSEDED  ConfigUpdateOperationState = 5
-	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_CANCELLED   ConfigUpdateOperationState = 6
+	// The sandbox is stopped or completed; the committed revision applies when
+	// it next starts. With outcome UNSUPPORTED, the sandbox's supervisor does not
+	// report apply results, so completion is untracked.
+	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_INACTIVE   ConfigUpdateOperationState = 3
+	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_FAILED     ConfigUpdateOperationState = 4
+	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_SUPERSEDED ConfigUpdateOperationState = 5
+	ConfigUpdateOperationState_CONFIG_UPDATE_OPERATION_STATE_CANCELLED  ConfigUpdateOperationState = 6
 )
 
 // Enum value maps for ConfigUpdateOperationState.
@@ -12565,7 +12568,10 @@ type UpdateConfigResponse struct {
 	// Sandbox metadata annotations after the update. Empty for global updates.
 	Annotations map[string]string `protobuf:"bytes,5,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Durable completion operation for a sandbox-scoped request, including an
-	// unchanged desired value. Omitted for global changes.
+	// unchanged desired value. Omitted for global changes, when the gateway
+	// keeps configuration polling, and for WAIT_FOR_COMPLETION requests whose
+	// supervisor does not report apply results. Clients then confirm
+	// application through policy status.
 	Operation     *ConfigUpdateOperation `protobuf:"bytes,6,opt,name=operation,proto3" json:"operation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

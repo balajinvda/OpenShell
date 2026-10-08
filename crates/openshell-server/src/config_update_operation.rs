@@ -366,7 +366,7 @@ pub async fn finish_pending_if_polling(
 }
 
 /// Finish every pending operation for a sandbox whose supervisor polls.
-pub async fn finish_pending_untracked(state: &ServerState, sandbox_id: &str) -> Result<(), Status> {
+async fn finish_pending_untracked(state: &ServerState, sandbox_id: &str) -> Result<(), Status> {
     let records = state
         .store
         .list_pending_config_operations_for_scope(sandbox_id)
@@ -554,19 +554,11 @@ async fn reconcile_records_for_sandbox(
             .current_session_applies_config(&sandbox_id)
             == Some(false)
     {
-        let components = if records.iter().any(targets_policy) {
-            crate::config_delivery::ConfigComponents::ALL
-        } else {
-            crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
-        };
         for record in records {
             if let Some(operation) = record.operation.as_ref() {
                 finish_untracked(state, &operation.operation_id).await?;
             }
         }
-        // A snapshot-only session still receives the change. Without push
-        // delivery this publishes nothing.
-        crate::config_delivery::publish_sandbox_components(state, &sandbox_id, components);
         return Ok(());
     }
 

@@ -1636,6 +1636,9 @@ enum ConfigUpdateOperationState {
   CONFIG_UPDATE_OPERATION_STATE_UNSPECIFIED = 0;
   CONFIG_UPDATE_OPERATION_STATE_PENDING = 1;
   CONFIG_UPDATE_OPERATION_STATE_APPLIED = 2;
+  // The sandbox is stopped or completed; the committed revision applies when
+  // it next starts. With outcome UNSUPPORTED, the sandbox's supervisor does not
+  // report apply results, so completion is untracked.
   CONFIG_UPDATE_OPERATION_STATE_INACTIVE = 3;
   CONFIG_UPDATE_OPERATION_STATE_FAILED = 4;
   CONFIG_UPDATE_OPERATION_STATE_SUPERSEDED = 5;
@@ -2896,7 +2899,10 @@ message UpdateConfigResponse {
   // Sandbox metadata annotations after the update. Empty for global updates.
   map<string, string> annotations = 5;
   // Durable completion operation for a sandbox-scoped request, including an
-  // unchanged desired value. Omitted for global changes.
+  // unchanged desired value. Omitted for global changes, when the gateway
+  // keeps configuration polling, and for WAIT_FOR_COMPLETION requests whose
+  // supervisor does not report apply results. Clients then confirm
+  // application through policy status.
   ConfigUpdateOperation operation = 6;
 }
 
