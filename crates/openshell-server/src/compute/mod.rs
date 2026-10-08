@@ -4963,6 +4963,10 @@ impl ComputeRuntime {
             {
                 return Err("restarting sandbox requires a fresh supervisor instance".into());
             }
+            let provisioning = admission
+                .map(|admission| admitted_provisioning(&current, admission))
+                .transpose()?
+                .flatten();
             let expected_resource_version = sandbox_resource_version(&current);
             let result = self
                 .store
@@ -4978,6 +4982,9 @@ impl ComputeRuntime {
                                     admission.state
                                         == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted),
                                 );
+                            }
+                            if provisioning.is_some() {
+                                status.provisioning.clone_from(&provisioning);
                             }
                             // An admission-only update leaves restart state to
                             // the instance that last reported runtime readiness.
@@ -6736,6 +6743,31 @@ fn apply_driver_snapshot(
     sandbox.set_phase(phase as i32);
     sandbox.set_current_policy_version(cpv);
     apply_configuration_readiness(sandbox);
+}
+
+/// Admission evidence from a supervisor session ends image preparation, as a
+/// polled configuration report does. Returns the updated provisioning record,
+/// or `None` when the sandbox has none.
+fn admitted_provisioning(
+    sandbox: &Sandbox,
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+) -> Result<Option<openshell_core::proto::SandboxProvisioning>, String> {
+    let Some(mut record) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.clone())
+    else {
+        return Ok(None);
+    };
+    let now_ms = openshell_core::time::now_ms();
+    if !provisioning_deadline::allows_admission(&record, now_ms) {
+        return Err("provisioning deadline expired".to_string());
+    }
+    provisioning_deadline::record_admission_start(&mut record, now_ms)?;
+    if admission.state == i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected) {
+        provisioning_deadline::record_rejection(&mut record, now_ms)?;
+    }
+    Ok(Some(record))
 }
 
 /// Configuration readiness is independent of compute/container readiness.

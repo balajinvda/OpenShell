@@ -8387,6 +8387,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_admission_ends_preparation_before_runtime_readiness() {
+        use crate::compute::provisioning_deadline::new_preparation_record;
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-streamed-admission";
+        let mut sandbox = test_sandbox(
+            sandbox_id,
+            "streamed-admission",
+            openshell_policy::restrictive_default_policy(),
+            Vec::new(),
+        );
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(new_preparation_record(current_time_ms(), 1800));
+        state.store.put_message(&sandbox).await.unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+
+        // Push mode reports admission over the supervisor session instead of
+        // ReportSandboxConfiguration, then reports runtime readiness.
+        state
+            .compute
+            .supervisor_session_admission(
+                sandbox_id,
+                &instance_id,
+                &SandboxConfigurationAdmission {
+                    instance_id: instance_id.clone(),
+                    state: ConfigurationAdmissionState::Accepted.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .compute
+            .supervisor_runtime_ready(sandbox_id, &instance_id)
+            .await
+            .unwrap();
+
+        let saved = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = saved.status.as_ref().unwrap();
+        assert!(
+            status
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .admission_start_time
+                .is_some()
+        );
+        assert_eq!(saved.phase(), i32::from(SandboxPhase::Ready));
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "Ready" && condition.status == "True"),
+            "{:?}",
+            status.conditions
+        );
+    }
+
+    #[tokio::test]
     async fn preparation_registration_starts_repair_once_after_a_cold_start() {
         use crate::compute::provisioning_deadline::new_preparation_record;
         use openshell_core::proto::{
