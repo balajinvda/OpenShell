@@ -3735,7 +3735,6 @@ pub async fn build_provider_environment_snapshot(
     )?;
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
-            state.store.as_ref(),
             &provider_profile_catalog,
             &provider_records,
             &policy_credential_bindings,
@@ -14678,7 +14677,6 @@ mod tests {
         state.store.put_message(&replacement).await.unwrap();
 
         let first_environment = crate::grpc::provider::resolve_provider_environment_from_records(
-            state.store.as_ref(),
             &catalog,
             &first_records,
         )
@@ -14719,7 +14717,6 @@ mod tests {
             compute_provider_env_revision_from_records(&catalog, &replacement_records).unwrap();
         let replacement_environment =
             crate::grpc::provider::resolve_provider_environment_from_records(
-                state.store.as_ref(),
                 &catalog,
                 &replacement_records,
             )
