@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use futures::{StreamExt as _, stream};
 use metrics::{counter, gauge, histogram};
-use openshell_core::ObjectId;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigComponent, ConfigComponentApplyResult, ConfigSnapshotRevision,
     ConfigUpdateOperation, ConfigUpdateOperationState, ObjectMeta, Sandbox, SandboxConfigRevision,
-    SandboxPhase, UpdateConfigResponse, config_snapshot_revision,
+    SandboxPhase, config_snapshot_revision,
 };
+use openshell_core::{ObjectId, ObjectWorkspace};
 use tonic::Status;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
@@ -38,19 +38,22 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_mins(1);
 const MAX_WAIT_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_SANITIZED_ERROR_BYTES: usize = 1_024;
 const OPERATION_DIMENSION_ANNOTATION: &str = "openshell.nvidia.com/config-operation-dimension";
-const REQUEST_FINGERPRINT_ANNOTATION: &str = "openshell.nvidia.com/request-fingerprint";
+const POLICY_DIMENSION: &str = "policy";
+const SETTINGS_DIMENSION: &str = "settings";
 
+/// Desired revision that completes an operation, in the one dimension its
+/// request mutated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperationDimension {
-    Policy,
-    Settings,
+pub enum OperationTarget {
+    PolicyVersion(u32),
+    SettingsRevision(u64),
 }
 
-impl OperationDimension {
-    const fn as_str(self) -> &'static str {
+impl OperationTarget {
+    const fn dimension(self) -> &'static str {
         match self {
-            Self::Policy => "policy",
-            Self::Settings => "settings",
+            Self::PolicyVersion(_) => POLICY_DIMENSION,
+            Self::SettingsRevision(_) => SETTINGS_DIMENSION,
         }
     }
 }
@@ -153,31 +156,6 @@ impl ObjectType for StoredConfigUpdateOperation {
     }
 }
 
-/// Desired-state revision an operation waits for. Completion compares only the
-/// dimension the operation changed; the other field is not correlated.
-#[derive(Debug, Clone, Copy)]
-pub struct OperationTarget {
-    pub policy_version: u32,
-    pub settings_revision: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CommittedResponse {
-    pub policy_version: u32,
-    pub policy_hash: String,
-    pub settings_revision: u64,
-    pub deleted: bool,
-    pub annotations: HashMap<String, String>,
-}
-
-pub fn operation_name(sandbox_id: &str, idempotency_key: &str, operation_id: &str) -> String {
-    if idempotency_key.is_empty() {
-        operation_id.to_string()
-    } else {
-        format!("{sandbox_id}:{idempotency_key}")
-    }
-}
-
 fn initial_state(phase: SandboxPhase) -> ConfigUpdateOperationState {
     match phase {
         SandboxPhase::Stopped | SandboxPhase::Completed => ConfigUpdateOperationState::Inactive,
@@ -200,41 +178,26 @@ pub fn sandbox_phase(sandbox: &Sandbox) -> SandboxPhase {
         .unwrap_or_default()
 }
 
-pub fn new_record(
-    sandbox: &Sandbox,
-    workspace: &str,
-    idempotency_key: &str,
-    dimension: OperationDimension,
-    request_fingerprint: Option<&str>,
-    target: OperationTarget,
-    response: CommittedResponse,
-) -> StoredConfigUpdateOperation {
+pub fn new_record(sandbox: &Sandbox, target: OperationTarget) -> StoredConfigUpdateOperation {
     let operation_id = Uuid::new_v4().to_string();
     let now = current_time_ms();
     let phase = sandbox_phase(sandbox);
     let state = initial_state(phase);
     let completed_time = terminal(state).then(|| timestamp(now));
+    let (target_policy_version, target_settings_revision) = match target {
+        OperationTarget::PolicyVersion(version) => (version, 0),
+        OperationTarget::SettingsRevision(revision) => (0, revision),
+    };
     StoredConfigUpdateOperation {
         metadata: Some(ObjectMeta {
             id: operation_id.clone(),
-            name: operation_name(sandbox.object_id(), idempotency_key, &operation_id),
+            name: operation_id.clone(),
             created_time: Some(timestamp(now)),
-            workspace: workspace.to_string(),
-            annotations: std::iter::once((
+            workspace: sandbox.object_workspace().to_string(),
+            annotations: HashMap::from([(
                 OPERATION_DIMENSION_ANNOTATION.to_string(),
-                dimension.as_str().to_string(),
-            ))
-            .chain(
-                request_fingerprint
-                    .filter(|_| !idempotency_key.is_empty())
-                    .map(|fingerprint| {
-                        (
-                            REQUEST_FINGERPRINT_ANNOTATION.to_string(),
-                            fingerprint.to_string(),
-                        )
-                    }),
-            )
-            .collect(),
+                target.dimension().to_string(),
+            )]),
             ..Default::default()
         }),
         operation: Some(ConfigUpdateOperation {
@@ -249,51 +212,13 @@ pub fn new_record(
             updated_time: Some(timestamp(now)),
             completed_time,
         }),
-        target_policy_version: target.policy_version,
-        target_settings_revision: target.settings_revision,
+        target_policy_version,
+        target_settings_revision,
         initial_phase: phase.into(),
-        idempotency_key: idempotency_key.to_string(),
         attempt_count: 0,
         next_attempt_time: Some(timestamp(now)),
-        response_policy_version: response.policy_version,
-        response_policy_hash: response.policy_hash,
-        response_settings_revision: response.settings_revision,
-        response_deleted: response.deleted,
-        response_annotations: response.annotations,
         ..Default::default()
     }
-}
-
-pub async fn find_idempotent(
-    state: &ServerState,
-    workspace: &str,
-    sandbox_id: &str,
-    idempotency_key: &str,
-    request_fingerprint: &str,
-) -> Result<Option<StoredConfigUpdateOperation>, Status> {
-    if idempotency_key.is_empty() {
-        return Ok(None);
-    }
-    let existing = state
-        .store
-        .get_message_by_name::<StoredConfigUpdateOperation>(
-            workspace,
-            &operation_name(sandbox_id, idempotency_key, ""),
-        )
-        .await
-        .map_err(|error| Status::internal(format!("fetch update operation failed: {error}")))?;
-    if let Some(record) = existing.as_ref() {
-        let stored_fingerprint = record
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.annotations.get(REQUEST_FINGERPRINT_ANNOTATION));
-        if stored_fingerprint.is_none_or(|stored| stored != request_fingerprint) {
-            return Err(Status::invalid_argument(
-                "idempotency_key was already used with a different request payload",
-            ));
-        }
-    }
-    Ok(existing)
 }
 
 pub async fn get_record(
@@ -307,63 +232,6 @@ pub async fn get_record(
         .map_err(|error| Status::internal(format!("fetch update operation failed: {error}")))
 }
 
-/// Rebuild operation query columns from protobuf payloads before selective
-/// reconciliation starts. Re-running after an interrupted startup is safe.
-pub async fn repair_query_projections(state: &ServerState) -> Result<(), Status> {
-    let mut offset = 0;
-    let mut repaired = 0_u64;
-    loop {
-        let records = state
-            .store
-            .list_all_messages::<StoredConfigUpdateOperation>(OPERATION_SCAN_PAGE_SIZE, offset)
-            .await
-            .map_err(|error| {
-                Status::internal(format!("list update operations for repair failed: {error}"))
-            })?;
-        let page_len = records.len();
-        for mut record in records {
-            if record.provider_receipt.is_some() {
-                continue;
-            }
-            for _ in 0..MAX_TRANSITION_RETRIES {
-                let Some(metadata) = record.metadata.as_ref() else {
-                    return Err(Status::internal("update operation metadata missing"));
-                };
-                let operation_id = metadata.id.clone();
-                let resource_version = metadata.resource_version;
-                if state
-                    .store
-                    .repair_config_operation_projection(&record, resource_version)
-                    .await
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "repair update operation projection failed: {error}"
-                        ))
-                    })?
-                {
-                    repaired = repaired.saturating_add(1);
-                    break;
-                }
-                let Some(current) = get_record(state, &operation_id).await? else {
-                    break;
-                };
-                record = current;
-            }
-        }
-        if page_len < OPERATION_SCAN_PAGE_SIZE as usize {
-            break;
-        }
-        offset = offset.saturating_add(OPERATION_SCAN_PAGE_SIZE);
-    }
-    if repaired > 0 {
-        info!(
-            repaired,
-            "configuration update operation projection repair complete"
-        );
-    }
-    Ok(())
-}
-
 pub fn public_operation(
     record: &StoredConfigUpdateOperation,
 ) -> Result<ConfigUpdateOperation, Status> {
@@ -371,19 +239,6 @@ pub fn public_operation(
         .operation
         .clone()
         .ok_or_else(|| Status::internal("stored update operation payload missing"))
-}
-
-pub fn response_from_record(
-    record: &StoredConfigUpdateOperation,
-) -> Result<UpdateConfigResponse, Status> {
-    Ok(UpdateConfigResponse {
-        version: record.response_policy_version,
-        policy_hash: record.response_policy_hash.clone(),
-        settings_revision: record.response_settings_revision,
-        deleted: record.response_deleted,
-        annotations: record.response_annotations.clone(),
-        operation: Some(public_operation(record)?),
-    })
 }
 
 pub fn terminal(state: ConfigUpdateOperationState) -> bool {
@@ -474,19 +329,16 @@ async fn finish(
     Ok(())
 }
 
-/// Completion of streamed configuration is not tracked here: the gateway keeps
-/// configuration polling, or the sandbox's supervisor does not apply streamed
-/// snapshots.
-const UNTRACKED_COMPLETION: &str = "the sandbox supervisor polls for configuration";
-
-/// Finish an operation whose completion the gateway cannot observe.
-pub async fn finish_untracked(state: &ServerState, operation_id: &str) -> Result<(), Status> {
+/// Finish an operation whose completion the gateway cannot observe because the
+/// sandbox supervisor polls for configuration and reports no apply results.
+/// The `UNSUPPORTED` outcome on an inactive operation marks it as untracked.
+async fn finish_untracked(state: &ServerState, operation_id: &str) -> Result<(), Status> {
     finish(
         state,
         operation_id,
         ConfigUpdateOperationState::Inactive,
-        ConfigApplyOutcome::Unspecified,
-        UNTRACKED_COMPLETION,
+        ConfigApplyOutcome::Unsupported,
+        "the sandbox supervisor does not report configuration apply results",
     )
     .await
 }
@@ -494,7 +346,7 @@ pub async fn finish_untracked(state: &ServerState, operation_id: &str) -> Result
 /// True for an operation finished because completion was not tracked.
 pub fn is_untracked(operation: &ConfigUpdateOperation) -> bool {
     operation.state == i32::from(ConfigUpdateOperationState::Inactive)
-        && operation.sanitized_error == UNTRACKED_COMPLETION
+        && operation.outcome == i32::from(ConfigApplyOutcome::Unsupported)
 }
 
 /// Finish pending operations when this replica's current session for the
@@ -599,26 +451,27 @@ fn target_relation(
     record: &StoredConfigUpdateOperation,
     snapshot: &openshell_core::proto::SandboxConfigSnapshot,
 ) -> std::cmp::Ordering {
-    match operation_dimension(record) {
-        OperationDimension::Policy => snapshot.version.cmp(&record.target_policy_version),
-        OperationDimension::Settings => snapshot
-            .settings_revision
-            .cmp(&record.target_settings_revision),
+    match operation_target(record) {
+        OperationTarget::PolicyVersion(version) => snapshot.version.cmp(&version),
+        OperationTarget::SettingsRevision(revision) => snapshot.settings_revision.cmp(&revision),
     }
 }
 
-fn operation_dimension(record: &StoredConfigUpdateOperation) -> OperationDimension {
-    match record
+/// Every sandbox configuration operation records its dimension at creation.
+fn operation_target(record: &StoredConfigUpdateOperation) -> OperationTarget {
+    let dimension = record
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.annotations.get(OPERATION_DIMENSION_ANNOTATION))
-        .map(String::as_str)
-    {
-        Some("policy") => OperationDimension::Policy,
-        Some("settings") => OperationDimension::Settings,
-        _ if record.response_policy_version != 0 => OperationDimension::Policy,
-        _ => OperationDimension::Settings,
+        .and_then(|metadata| metadata.annotations.get(OPERATION_DIMENSION_ANNOTATION));
+    if dimension.is_some_and(|dimension| dimension == POLICY_DIMENSION) {
+        OperationTarget::PolicyVersion(record.target_policy_version)
+    } else {
+        OperationTarget::SettingsRevision(record.target_settings_revision)
     }
+}
+
+fn targets_policy(record: &StoredConfigUpdateOperation) -> bool {
+    matches!(operation_target(record), OperationTarget::PolicyVersion(_))
 }
 
 pub async fn reconcile_one(state: &Arc<ServerState>, operation_id: &str) -> Result<(), Status> {
@@ -701,10 +554,7 @@ async fn reconcile_records_for_sandbox(
             .current_session_applies_config(&sandbox_id)
             == Some(false)
     {
-        let components = if records
-            .iter()
-            .any(|record| operation_dimension(record) == OperationDimension::Policy)
-        {
+        let components = if records.iter().any(targets_policy) {
             crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
         } else {
             crate::config_delivery::ConfigComponents::SANDBOX_CONFIG
@@ -760,9 +610,7 @@ async fn reconcile_records_for_sandbox(
     // builds the current snapshot once, records its exact revision on matching
     // operations, then sends those same bytes. A failed admission remains
     // recoverable when the claim's retry deadline expires.
-    let publish_provider_environment = claimed_records
-        .iter()
-        .any(|record| operation_dimension(record) == OperationDimension::Policy);
+    let publish_provider_environment = claimed_records.iter().any(targets_policy);
     let components = if publish_provider_environment {
         crate::config_delivery::ConfigComponents::SANDBOX_AND_PROVIDER
     } else {
@@ -1054,29 +902,22 @@ mod tests {
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
-        let record = new_record(
-            &sandbox,
-            "default",
-            "operation-test-request",
-            OperationDimension::Settings,
-            None,
-            OperationTarget {
-                policy_version: 0,
-                settings_revision: 1,
-            },
-            CommittedResponse::default(),
-        );
+        let record = new_record(&sandbox, OperationTarget::SettingsRevision(1));
         state
             .store
-            .put_if_with_operation(
+            .put_sandbox_settings_atomic(
                 crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
                 "operation-test-settings",
                 "operation-test-sandbox",
                 "default",
                 br#"{"revision":1,"settings":{}}"#,
                 crate::persistence::WriteCondition::MustCreate,
-                &record,
-                None,
+                &crate::persistence::AtomicSandboxProjection {
+                    sandbox_id: sandbox.object_id(),
+                    annotations: &HashMap::new(),
+                    expected_resource_version: 0,
+                },
+                Some(&record),
             )
             .await
             .unwrap();
@@ -1140,18 +981,8 @@ mod tests {
 
     #[test]
     fn target_relation_compares_only_the_mutated_dimension() {
-        let mut record = StoredConfigUpdateOperation {
-            metadata: Some(ObjectMeta {
-                annotations: HashMap::from([(
-                    OPERATION_DIMENSION_ANNOTATION.to_string(),
-                    OperationDimension::Policy.as_str().to_string(),
-                )]),
-                ..Default::default()
-            }),
-            target_policy_version: 7,
-            target_settings_revision: 11,
-            ..Default::default()
-        };
+        let sandbox = Sandbox::default();
+        let record = new_record(&sandbox, OperationTarget::PolicyVersion(7));
         let snapshot = |version, settings_revision| SandboxConfigSnapshot {
             version,
             settings_revision,
@@ -1175,10 +1006,7 @@ mod tests {
             std::cmp::Ordering::Less
         );
 
-        record.metadata.as_mut().unwrap().annotations.insert(
-            OPERATION_DIMENSION_ANNOTATION.to_string(),
-            OperationDimension::Settings.as_str().to_string(),
-        );
+        let record = new_record(&sandbox, OperationTarget::SettingsRevision(11));
         assert_eq!(
             target_relation(&record, &snapshot(8, 11)),
             std::cmp::Ordering::Equal

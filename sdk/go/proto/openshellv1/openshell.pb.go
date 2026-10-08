@@ -11768,18 +11768,20 @@ type UpdateConfigRequest struct {
 	Annotations map[string]string `protobuf:"bytes,9,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Controls whether the RPC returns after commit or after the runtime reaches
 	// a terminal outcome, including failure, supersession, cancellation or inactivity.
-	// Unspecified preserves commit-only compatibility.
+	// Unspecified preserves commit-only compatibility. A gateway that does not
+	// track completion, for example because supervisors poll for configuration,
+	// returns the committed result without an operation.
 	WaitMode ConfigUpdateWaitMode `protobuf:"varint,12,opt,name=wait_mode,json=waitMode,proto3,enum=openshell.v1.ConfigUpdateWaitMode" json:"wait_mode,omitempty"`
-	// Optional retry key scoped to the sandbox. Reusing a key returns the
-	// original operation and never creates another desired-state revision.
-	IdempotencyKey string `protobuf:"bytes,13,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// Server-side wait bound for WAIT_FOR_COMPLETION. Zero uses 60 seconds. The
 	// operation remains durable and may complete after this RPC times out.
-	WaitTimeout *durationpb.Duration `protobuf:"bytes,14,opt,name=wait_timeout,json=waitTimeout,proto3" json:"wait_timeout,omitempty"`
+	WaitTimeout *durationpb.Duration `protobuf:"bytes,13,opt,name=wait_timeout,json=waitTimeout,proto3" json:"wait_timeout,omitempty"`
 	// Required for sandbox-scoped updates and empty for global updates.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
+	// wait_mode and wait_timeout are not part of the admitted request: a retry
+	// with the same request_id replays the committed result, including its
+	// operation, and WAIT_FOR_COMPLETION waits again on that operation.
 	RequestId     string `protobuf:"bytes,11,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -11883,13 +11885,6 @@ func (x *UpdateConfigRequest) GetWaitMode() ConfigUpdateWaitMode {
 		return x.WaitMode
 	}
 	return ConfigUpdateWaitMode_CONFIG_UPDATE_WAIT_MODE_UNSPECIFIED
-}
-
-func (x *UpdateConfigRequest) GetIdempotencyKey() string {
-	if x != nil {
-		return x.IdempotencyKey
-	}
-	return ""
 }
 
 func (x *UpdateConfigRequest) GetWaitTimeout() *durationpb.Duration {
@@ -20456,7 +20451,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rexpires_after\x18f \x01(\v2\x19.google.protobuf.DurationR\fexpiresAfter\x12\x1d\n" +
 	"\n" +
 	"token_type\x18\x03 \x01(\tR\ttokenTypeJ\x04\b\x02\x10\x03R\n" +
-	"expires_in\"\xd1\x06\n" +
+	"expires_in\"\xa8\x06\n" +
 	"\x13UpdateConfigRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\n" +
 	" \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12;\n" +
@@ -20469,9 +20464,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\x10merge_operations\x18\a \x03(\v2\".openshell.v1.PolicyMergeOperationR\x0fmergeOperations\x12:\n" +
 	"\x19expected_resource_version\x18\b \x01(\x04R\x17expectedResourceVersion\x12T\n" +
 	"\vannotations\x18\t \x03(\v22.openshell.v1.UpdateConfigRequest.AnnotationsEntryR\vannotations\x12?\n" +
-	"\twait_mode\x18\f \x01(\x0e2\".openshell.v1.ConfigUpdateWaitModeR\bwaitMode\x12'\n" +
-	"\x0fidempotency_key\x18\r \x01(\tR\x0eidempotencyKey\x12<\n" +
-	"\fwait_timeout\x18\x0e \x01(\v2\x19.google.protobuf.DurationR\vwaitTimeout\x12\x18\n" +
+	"\twait_mode\x18\f \x01(\x0e2\".openshell.v1.ConfigUpdateWaitModeR\bwaitMode\x12<\n" +
+	"\fwait_timeout\x18\r \x01(\v2\x19.google.protobuf.DurationR\vwaitTimeout\x12\x18\n" +
 	"\asandbox\x18\x01 \x01(\tR\asandbox\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\v \x01(\tR\trequestId\x1a>\n" +

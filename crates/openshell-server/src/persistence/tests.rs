@@ -5,9 +5,7 @@ use super::{
     AtomicSandboxProjection, ObjectId, ObjectListQuery, ObjectName, ObjectType, PersistenceError,
     PolicyRecord, Store, generate_name, test_store,
 };
-use crate::config_update_operation::{
-    CommittedResponse, OperationDimension, OperationTarget, new_record,
-};
+use crate::config_update_operation::{OperationTarget, new_record};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -1367,28 +1365,39 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
     }
 }
 
-fn config_operation_for(
+fn settings_operation_for(
     sandbox: &Sandbox,
-    policy_version: u32,
     settings_revision: u64,
 ) -> crate::storage_proto::StoredConfigUpdateOperation {
-    let dimension = if policy_version == 0 {
-        OperationDimension::Settings
-    } else {
-        OperationDimension::Policy
-    };
     new_record(
         sandbox,
-        "default",
-        "",
-        dimension,
-        None,
-        OperationTarget {
-            policy_version,
-            settings_revision,
-        },
-        CommittedResponse::default(),
+        OperationTarget::SettingsRevision(settings_revision),
     )
+}
+
+/// Create sandbox settings together with a completion operation.
+async fn put_settings_with_operation(
+    store: &Store,
+    sandbox: &Sandbox,
+    settings_id: &str,
+    operation: &crate::storage_proto::StoredConfigUpdateOperation,
+) -> Result<Sandbox, PersistenceError> {
+    store
+        .put_sandbox_settings_atomic(
+            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+            settings_id,
+            sandbox.object_name(),
+            "default",
+            br#"{"revision":1,"settings":{}}"#,
+            super::WriteCondition::MustCreate,
+            &AtomicSandboxProjection {
+                sandbox_id: sandbox.object_id(),
+                annotations: &StdHashMap::new(),
+                expected_resource_version: 0,
+            },
+            Some(operation),
+        )
+        .await
 }
 
 #[tokio::test]
@@ -1398,19 +1407,9 @@ async fn operation_cas_updates_sql_state_and_due_index_together() {
     let store = test_store().await;
     let sandbox = policy_test_sandbox("operation-state-sandbox", "operation-state-sandbox");
     store.put_message(&sandbox).await.unwrap();
-    let operation = config_operation_for(&sandbox, 0, 1);
+    let operation = settings_operation_for(&sandbox, 1);
     let operation_id = operation.operation.as_ref().unwrap().operation_id.clone();
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "operation-state-settings",
-            sandbox.object_name(),
-            "default",
-            br#"{"revision":1,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &operation,
-            None,
-        )
+    put_settings_with_operation(&store, &sandbox, "operation-state-settings", &operation)
         .await
         .unwrap();
 
@@ -1446,72 +1445,6 @@ async fn operation_cas_updates_sql_state_and_due_index_together() {
 }
 
 #[tokio::test]
-async fn operation_projection_repair_decodes_authoritative_payload_without_version_churn() {
-    use openshell_core::proto::ConfigUpdateOperationState;
-
-    let store = test_store().await;
-    let sandbox = policy_test_sandbox("operation-repair-sandbox", "operation-repair-sandbox");
-    store.put_message(&sandbox).await.unwrap();
-    let operation = config_operation_for(&sandbox, 0, 1);
-    let operation_id = operation.operation.as_ref().unwrap().operation_id.clone();
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "operation-repair-settings",
-            sandbox.object_name(),
-            "default",
-            br#"{"revision":1,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &operation,
-            None,
-        )
-        .await
-        .unwrap();
-
-    let terminal = store
-        .update_message_cas::<crate::storage_proto::StoredConfigUpdateOperation, _>(
-            &operation_id,
-            0,
-            |record| {
-                record.operation.as_mut().unwrap().state =
-                    ConfigUpdateOperationState::Applied.into();
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .list_pending_config_operations_for_scope(sandbox.object_id())
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "generic legacy writes leave the SQL projection stale"
-    );
-
-    let version = terminal.metadata.as_ref().unwrap().resource_version;
-    assert!(
-        store
-            .repair_config_operation_projection(&terminal, version)
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .list_pending_config_operations_for_scope(sandbox.object_id())
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let repaired = store
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(repaired.metadata.unwrap().resource_version, version);
-}
-
-#[tokio::test]
 async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
     let store = test_store().await;
     let first_sandbox = policy_test_sandbox("operation-query-a", "operation-query-a");
@@ -1519,29 +1452,24 @@ async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
     store.put_message(&first_sandbox).await.unwrap();
     store.put_message(&second_sandbox).await.unwrap();
 
-    let mut first = config_operation_for(&first_sandbox, 0, 1);
+    let mut first = settings_operation_for(&first_sandbox, 1);
     first.next_attempt_time = Some(openshell_core::time::timestamp_from_millis(10).unwrap());
     let first_id = first.operation.as_ref().unwrap().operation_id.clone();
-    let mut second = config_operation_for(&second_sandbox, 0, 1);
+    let mut second = settings_operation_for(&second_sandbox, 1);
     second.next_attempt_time = Some(openshell_core::time::timestamp_from_millis(10).unwrap());
     let second_id = second.operation.as_ref().unwrap().operation_id.clone();
     for (index, (sandbox, operation)) in [(&first_sandbox, &first), (&second_sandbox, &second)]
         .into_iter()
         .enumerate()
     {
-        store
-            .put_if_with_operation(
-                crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-                &format!("operation-query-settings-{index}"),
-                sandbox.object_name(),
-                "default",
-                br#"{"revision":1,"settings":{}}"#,
-                super::WriteCondition::MustCreate,
-                operation,
-                None,
-            )
-            .await
-            .unwrap();
+        put_settings_with_operation(
+            &store,
+            sandbox,
+            &format!("operation-query-settings-{index}"),
+            operation,
+        )
+        .await
+        .unwrap();
     }
 
     let scoped = store
@@ -1577,130 +1505,108 @@ async fn pending_operation_queries_are_scoped_bounded_and_due_ordered() {
     assert!([&first_id, &second_id].contains(&second_page_id));
 }
 
-#[tokio::test]
-async fn configuration_transactions_store_only_the_requested_target() {
-    let store = test_store().await;
-    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
-}
-
-#[tokio::test]
-#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
-async fn postgres_configuration_transactions_store_only_the_requested_target() {
-    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
-    let store = Store::connect(&url).await.unwrap();
-    Box::pin(assert_configuration_transactions_store_only_the_requested_target(&store)).await;
-}
-
-// Completion correlates on the dimension an operation changed, so writes keep
-// the requested target instead of stamping the other dimension's revision.
-async fn assert_configuration_transactions_store_only_the_requested_target(store: &Store) {
-    let suffix = uuid::Uuid::new_v4();
-
-    let settings_sandbox = policy_test_sandbox(
-        &format!("target-settings-write-{suffix}"),
-        &format!("target-settings-write-{suffix}"),
-    );
-    store.put_message(&settings_sandbox).await.unwrap();
-    store
-        .put_policy_revision(
-            &format!("target-settings-policy-{suffix}"),
-            settings_sandbox.object_id(),
-            "default",
-            1,
-            &SandboxPolicy::default().encode_to_vec(),
-            "target-settings-policy-hash",
-        )
-        .await
-        .unwrap();
-    let settings_operation = config_operation_for(&settings_sandbox, 0, 1);
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            &format!("target-settings-record-{suffix}"),
-            settings_sandbox.object_name(),
-            "default",
-            br#"{"revision":1,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &settings_operation,
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        stored_operation_target(store, &settings_operation).await,
-        (0, 1)
-    );
-
-    let policy_sandbox = policy_test_sandbox(
-        &format!("target-policy-write-{suffix}"),
-        &format!("target-policy-write-{suffix}"),
-    );
-    store.put_message(&policy_sandbox).await.unwrap();
-    let settings_seed = config_operation_for(&policy_sandbox, 0, 2);
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            &format!("target-policy-settings-record-{suffix}"),
-            policy_sandbox.object_name(),
-            "default",
-            br#"{"revision":2,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &settings_seed,
-            None,
-        )
-        .await
-        .unwrap();
-    let current = store
-        .get_message::<Sandbox>(policy_sandbox.object_id())
-        .await
-        .unwrap()
-        .unwrap();
-    let policy_operation = config_operation_for(&policy_sandbox, 1, 0);
-    store
-        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
-            id: format!("target-policy-revision-{suffix}"),
-            sandbox_id: policy_sandbox.object_id().to_string(),
-            workspace: "default".to_string(),
-            version: 1,
-            policy_payload: SandboxPolicy::default().encode_to_vec(),
-            policy_hash: "target-policy-hash".to_string(),
-            provenance: StdHashMap::new(),
-            expected_resource_version: current.metadata.as_ref().unwrap().resource_version,
-            annotations: StdHashMap::new(),
-            backfill_policy: None,
-            operation: Some(policy_operation.clone()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        stored_operation_target(store, &policy_operation).await,
-        (1, 0)
-    );
-
-    let mut unchanged = config_operation_for(&policy_sandbox, 1, 0);
-    unchanged.response_policy_version = 1;
+/// Sandbox deletion records its phase before removing the sandbox's
+/// operations, so no operation may be inserted after that phase change.
+async fn assert_deleting_sandbox_rejects_operations(store: &Store) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let sandbox = policy_test_sandbox(&id, &id);
+    store.put_message(&sandbox).await.unwrap();
+    let unchanged = settings_operation_for(&sandbox, 0);
     store
         .insert_existing_config_operation(&unchanged)
         .await
         .unwrap();
-    assert_eq!(stored_operation_target(store, &unchanged).await, (1, 0));
+    assert_eq!(
+        store
+            .list_pending_config_operations_for_scope(&id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store
+        .update_message_cas::<Sandbox, _>(&id, 0, |sandbox| {
+            sandbox.set_phase(openshell_core::proto::SandboxPhase::Deleting as i32);
+        })
+        .await
+        .unwrap();
+    let current = store.get_message::<Sandbox>(&id).await.unwrap().unwrap();
+
+    let error = store
+        .insert_existing_config_operation(&settings_operation_for(&sandbox, 0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, PersistenceError::Conflict { .. }),
+        "{error}"
+    );
+    let error = put_settings_with_operation(
+        store,
+        &sandbox,
+        &uuid::Uuid::new_v4().to_string(),
+        &settings_operation_for(&sandbox, 1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, PersistenceError::Conflict { .. }),
+        "{error}"
+    );
+    let error = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: uuid::Uuid::new_v4().to_string(),
+            sandbox_id: id.clone(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: SandboxPolicy::default().encode_to_vec(),
+            policy_hash: "deleting-hash".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: current.metadata.as_ref().unwrap().resource_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: None,
+            operation: Some(new_record(&sandbox, OperationTarget::PolicyVersion(1))),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, PersistenceError::Conflict { .. }),
+        "{error}"
+    );
+
+    assert_eq!(
+        store
+            .list_pending_config_operations_for_scope(&id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .get_by_name(
+                crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+                "default",
+                &id
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_latest_policy(&id).await.unwrap().is_none());
 }
 
-async fn stored_operation_target(
-    store: &Store,
-    operation: &crate::storage_proto::StoredConfigUpdateOperation,
-) -> (u32, u64) {
-    let stored = store
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(
-            &operation.operation.as_ref().unwrap().operation_id,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    (
-        stored.target_policy_version,
-        stored.target_settings_revision,
-    )
+#[tokio::test]
+async fn deleting_sandbox_rejects_operations() {
+    assert_deleting_sandbox_rejects_operations(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_deleting_sandbox_rejects_operations() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    assert_deleting_sandbox_rejects_operations(&store).await;
 }
 
 async fn settings_projection_uses_locked_sandbox_version(
@@ -1735,38 +1641,22 @@ async fn settings_projection_uses_locked_sandbox_version(
     let projection_changes_sandbox = requested
         .iter()
         .any(|(key, value)| before.metadata.as_ref().unwrap().annotations.get(key) != Some(value));
-    let operation = new_record(
-        &stale,
-        "default",
-        "",
-        OperationDimension::Settings,
-        None,
-        OperationTarget {
-            policy_version: 0,
-            settings_revision: 1,
-        },
-        CommittedResponse {
-            settings_revision: 1,
-            annotations: requested.clone(),
-            ..Default::default()
-        },
-    );
-    let operation_id = operation.operation.as_ref().unwrap().operation_id.clone();
+    let operation = settings_operation_for(&stale, 1);
 
-    store
-        .put_if_with_operation(
+    let projected = store
+        .put_sandbox_settings_atomic(
             crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
             &format!("settings-projection-record-{suffix}"),
             &sandbox_name,
             "default",
             br#"{"revision":1,"settings":{}}"#,
             super::WriteCondition::MustCreate,
-            &operation,
-            Some(&AtomicSandboxProjection {
+            &AtomicSandboxProjection {
                 sandbox_id: &sandbox_id,
                 annotations: &requested,
                 expected_resource_version: 0,
-            }),
+            },
+            Some(&operation),
         )
         .await
         .unwrap();
@@ -1788,14 +1678,7 @@ async fn settings_projection_uses_locked_sandbox_version(
     for (key, value) in &requested {
         assert_eq!(metadata.annotations.get(key), Some(value));
     }
-
-    let stored_operation = store
-        .get_message::<crate::storage_proto::StoredConfigUpdateOperation>(&operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let response = crate::config_update_operation::response_from_record(&stored_operation).unwrap();
-    assert_eq!(response.annotations, metadata.annotations);
+    assert_eq!(projected.metadata.as_ref().unwrap(), metadata);
 }
 
 #[tokio::test]
@@ -1827,53 +1710,25 @@ async fn operation_insert_failure_rolls_back_settings_write() {
     let store = test_store().await;
     let sandbox = policy_test_sandbox("operation-rollback", "operation-rollback");
     store.put_message(&sandbox).await.unwrap();
-    let operation = new_record(
-        &sandbox,
-        "default",
-        "same-request",
-        OperationDimension::Settings,
-        None,
-        OperationTarget {
-            policy_version: 0,
-            settings_revision: 1,
-        },
-        CommittedResponse::default(),
-    );
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "operation-rollback-settings",
-            sandbox.object_name(),
-            "default",
-            br#"{"revision":1,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &operation,
-            None,
-        )
+    let operation = settings_operation_for(&sandbox, 1);
+    put_settings_with_operation(&store, &sandbox, "operation-rollback-settings", &operation)
         .await
         .unwrap();
-    let duplicate_operation = new_record(
-        &sandbox,
-        "default",
-        "same-request",
-        OperationDimension::Settings,
-        None,
-        OperationTarget {
-            policy_version: 0,
-            settings_revision: 2,
-        },
-        CommittedResponse::default(),
-    );
+    // Reusing the committed operation ID makes the operation insert fail.
     let error = store
-        .put_if_with_operation(
+        .put_sandbox_settings_atomic(
             crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
             "operation-rollback-settings",
             sandbox.object_name(),
             "default",
             br#"{"revision":2,"settings":{}}"#,
             super::WriteCondition::MatchResourceVersion(1),
-            &duplicate_operation,
-            None,
+            &AtomicSandboxProjection {
+                sandbox_id: sandbox.object_id(),
+                annotations: &StdHashMap::from([("changed".to_string(), "true".to_string())]),
+                expected_resource_version: 0,
+            },
+            Some(&operation),
         )
         .await
         .unwrap_err();
@@ -1888,6 +1743,12 @@ async fn operation_insert_failure_rolls_back_settings_write() {
         .unwrap();
     assert_eq!(settings.payload, br#"{"revision":1,"settings":{}}"#);
     assert_eq!(settings.resource_version, 1);
+    let after = store
+        .get_message::<Sandbox>(sandbox.object_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
 }
 
 #[tokio::test]
@@ -1895,48 +1756,25 @@ async fn operation_insert_failure_rolls_back_policy_and_projection() {
     let store = test_store().await;
     let sandbox = policy_test_sandbox("policy-operation-rollback", "policy-operation-rollback");
     store.put_message(&sandbox).await.unwrap();
-    let existing_operation = new_record(
+    let existing_operation = settings_operation_for(&sandbox, 1);
+    put_settings_with_operation(
+        &store,
         &sandbox,
-        "default",
-        "duplicate-policy-request",
-        OperationDimension::Settings,
-        None,
-        OperationTarget {
-            policy_version: 0,
-            settings_revision: 1,
-        },
-        CommittedResponse::default(),
-    );
-    store
-        .put_if_with_operation(
-            crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
-            "policy-operation-rollback-settings",
-            sandbox.object_name(),
-            "default",
-            br#"{"revision":1,"settings":{}}"#,
-            super::WriteCondition::MustCreate,
-            &existing_operation,
-            None,
-        )
-        .await
-        .unwrap();
+        "policy-operation-rollback-settings",
+        &existing_operation,
+    )
+    .await
+    .unwrap();
     let before = store
         .get_message::<Sandbox>(sandbox.object_id())
         .await
         .unwrap()
         .unwrap();
-    let duplicate_operation = new_record(
-        &sandbox,
-        "default",
-        "duplicate-policy-request",
-        OperationDimension::Policy,
-        None,
-        OperationTarget {
-            policy_version: 1,
-            settings_revision: 0,
-        },
-        CommittedResponse::default(),
-    );
+    // Reusing the committed operation ID makes the operation insert fail.
+    let mut duplicate_operation = new_record(&sandbox, OperationTarget::PolicyVersion(1));
+    duplicate_operation
+        .metadata
+        .clone_from(&existing_operation.metadata);
     let policy = SandboxPolicy::default();
     let error = store
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {

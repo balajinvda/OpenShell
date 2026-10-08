@@ -884,7 +884,7 @@ mutation!(
     UpdateConfigRequest,
     UpdateConfigResponse,
     "UpdateConfig",
-    policy::handle_update_config_commit,
+    policy::handle_update_config,
     async |req: &UpdateConfigRequest, state: &ServerState, principal: &Principal| {
         if req.global {
             if req.workspace_scope.is_some() {

@@ -235,8 +235,11 @@ mod tests {
     // traffic and are never stored.
     // ConfigApplyOutcome gains AWAITING_COMPONENT, which is reachable from
     // stored operations but never recorded on one: it is not terminal.
+    // UpdateConfigRequest carries only wait_mode and wait_timeout for
+    // completion; request_id replay covers retries, so the request has no
+    // separate idempotency key. Requests are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "22be3261c1f0b4059f905955b73ea6048e407e8108f894097cf8b873c16c0fdb";
+        "c1a493e428d0789d6eb8e8e388e0f681412f0f852e3cd1ebf28e923b74458ed3";
     const DURABLE_SCHEMA_SHA256: &str =
         "fc80b20dba6ca8ba69f16d96d75b8788c9f660ec66c56af15124fb1b0c514b1f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

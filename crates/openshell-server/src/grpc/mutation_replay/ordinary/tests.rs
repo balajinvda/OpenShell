@@ -1254,3 +1254,76 @@ async fn config_completion_timeout_preserves_replayable_committed_operation() {
         .unwrap_err();
     assert_eq!(error.code(), Code::InvalidArgument);
 }
+
+#[tokio::test]
+async fn waited_config_retry_replays_the_committed_operation() {
+    use openshell_core::proto::open_shell_server::OpenShell;
+    use openshell_core::proto::{
+        ConfigUpdateOperationState, ConfigUpdateWaitMode, Sandbox, SandboxStatus,
+        UpdateConfigRequest,
+    };
+    let (_directory, mut state) = protected_state().await;
+    crate::grpc::test_support::enable_push_delivery(&mut state);
+    // A stopped sandbox completes its operation as inactive at commit.
+    state
+        .store
+        .put_message(&Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "stopped-sandbox-id".into(),
+                name: "stopped-sandbox".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec::default()),
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Stopped.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let service = crate::grpc::OpenShellService::new(state.clone());
+    let request = UpdateConfigRequest {
+        sandbox: "stopped-sandbox".into(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        setting_key: "ocsf_json_enabled".into(),
+        setting_value: Some(SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        }),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        wait_mode: ConfigUpdateWaitMode::WaitForCompletion.into(),
+        ..Default::default()
+    };
+
+    let first = service
+        .update_config(authed_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = first.operation.expect("committed operation");
+    assert_eq!(operation.state, ConfigUpdateOperationState::Inactive as i32);
+    assert_eq!(first.settings_revision, 1);
+
+    let retried = service
+        .update_config(authed_request(request))
+        .await
+        .unwrap();
+    assert_eq!(
+        retried.metadata().get("openshell-replayed").unwrap(),
+        "true"
+    );
+    let retried = retried.into_inner();
+    assert_eq!(
+        retried.operation.unwrap().operation_id,
+        operation.operation_id
+    );
+    assert_eq!(retried.settings_revision, 1);
+    assert_eq!(
+        policy::load_sandbox_settings(&state.store, "default", "stopped-sandbox")
+            .await
+            .unwrap()
+            .revision,
+        1
+    );
+}

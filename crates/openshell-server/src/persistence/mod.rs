@@ -29,8 +29,8 @@ pub const CONFIG_COMPONENT_OBSERVATION_OBJECT_TYPE: &str = "config_component_obs
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
-/// Optional sandbox projection committed with a settings mutation and its
-/// durable operation.
+/// Sandbox annotations projected in the same transaction as a sandbox
+/// settings mutation.
 pub struct AtomicSandboxProjection<'a> {
     pub sandbox_id: &'a str,
     pub annotations: &'a HashMap<String, String>,
@@ -38,15 +38,13 @@ pub struct AtomicSandboxProjection<'a> {
 }
 
 impl AtomicSandboxProjection<'_> {
-    fn apply_and_sync_operation_response(
+    /// Merge the requested annotations into the locked sandbox payload.
+    /// Returns the projected sandbox and whether its payload changed.
+    fn apply(
         &self,
         payload: &[u8],
         current_resource_version: u64,
-        operation_record: &mut crate::storage_proto::StoredConfigUpdateOperation,
     ) -> PersistenceResult<(openshell_core::proto::Sandbox, bool)> {
-        use openshell_core::SetResourceVersion as _;
-        use prost::Message as _;
-
         if self.expected_resource_version != 0
             && self.expected_resource_version != current_resource_version
         {
@@ -55,12 +53,7 @@ impl AtomicSandboxProjection<'_> {
             });
         }
 
-        let payload = migrate_legacy_time_fields("sandbox", payload)?;
-        let mut sandbox =
-            openshell_core::proto::Sandbox::decode(payload.as_slice()).map_err(|error| {
-                PersistenceError::Decode(format!("decode sandbox payload failed: {error}"))
-            })?;
-        sandbox.set_resource_version(current_resource_version);
+        let mut sandbox = decode_sandbox_payload(payload, current_resource_version)?;
         let metadata = sandbox.metadata.as_mut().ok_or_else(|| {
             PersistenceError::Decode("sandbox payload missing metadata".to_string())
         })?;
@@ -71,11 +64,87 @@ impl AtomicSandboxProjection<'_> {
                 changed = true;
             }
         }
-        operation_record
-            .response_annotations
-            .clone_from(&metadata.annotations);
         Ok((sandbox, changed))
     }
+}
+
+fn decode_sandbox_payload(
+    payload: &[u8],
+    current_resource_version: u64,
+) -> PersistenceResult<openshell_core::proto::Sandbox> {
+    use openshell_core::SetResourceVersion as _;
+
+    let payload = migrate_legacy_time_fields("sandbox", payload)?;
+    let mut sandbox =
+        openshell_core::proto::Sandbox::decode(payload.as_slice()).map_err(|error| {
+            PersistenceError::Decode(format!("decode sandbox payload failed: {error}"))
+        })?;
+    sandbox.set_resource_version(current_resource_version);
+    Ok(sandbox)
+}
+
+/// Refuse a completion operation for a sandbox whose deletion has begun.
+///
+/// Sandbox deletion records the deleting phase before it removes the
+/// sandbox's operations. Every operation insert runs in a transaction that
+/// holds the sandbox row, so it either commits before that phase change and is
+/// removed with the sandbox, or observes the phase here and is rejected.
+fn ensure_sandbox_accepts_operations(
+    sandbox: &openshell_core::proto::Sandbox,
+    current_resource_version: u64,
+) -> PersistenceResult<()> {
+    let deleting = sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == openshell_core::proto::SandboxPhase::Deleting as i32);
+    if deleting {
+        return Err(PersistenceError::Conflict {
+            current_resource_version: Some(current_resource_version),
+        });
+    }
+    Ok(())
+}
+
+/// Column values for one configuration operation row. The protobuf payload is
+/// authoritative; `scope`, `status`, and `next_attempt_at_ms` index pending
+/// operations by sandbox and retry time.
+struct ConfigOperationRow<'a> {
+    id: &'a str,
+    name: &'a str,
+    workspace: &'a str,
+    sandbox_id: &'a str,
+    status: &'static str,
+    next_attempt_at_ms: i64,
+    payload: Vec<u8>,
+}
+
+impl<'a> ConfigOperationRow<'a> {
+    fn new(
+        record: &'a crate::storage_proto::StoredConfigUpdateOperation,
+    ) -> PersistenceResult<Self> {
+        let metadata = record.metadata.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation metadata missing".to_string())
+        })?;
+        let operation = record.operation.as_ref().ok_or_else(|| {
+            PersistenceError::Encode("update operation payload missing".to_string())
+        })?;
+        let state = openshell_core::proto::ConfigUpdateOperationState::try_from(operation.state)
+            .unwrap_or_default();
+        Ok(Self {
+            id: &metadata.id,
+            name: &metadata.name,
+            workspace: &metadata.workspace,
+            sandbox_id: &operation.sandbox_id,
+            status: state.as_str_name(),
+            next_attempt_at_ms: record.next_attempt_at_ms(),
+            payload: record.encode_to_vec(),
+        })
+    }
+}
+
+/// `status` column value of operations that still await a terminal result.
+fn pending_operation_status() -> &'static str {
+    openshell_core::proto::ConfigUpdateOperationState::Pending.as_str_name()
 }
 
 /// Result of a compare-and-swap update that already has the current payload.
@@ -497,10 +566,12 @@ impl Store {
         ))
     }
 
-    /// Write desired state and its durable update operation in one database
-    /// transaction. Used by sandbox-scoped settings mutations.
+    /// Write sandbox settings and project request annotations onto the
+    /// sandbox in one database transaction, together with the update's
+    /// durable completion operation when one is given. Returns the projected
+    /// sandbox.
     #[allow(clippy::too_many_arguments)]
-    pub async fn put_if_with_operation(
+    pub async fn put_sandbox_settings_atomic(
         &self,
         object_type: &str,
         id: &str,
@@ -508,18 +579,18 @@ impl Store {
         workspace: &str,
         payload: &[u8],
         condition: WriteCondition,
-        operation: &crate::storage_proto::StoredConfigUpdateOperation,
-        sandbox_projection: Option<&AtomicSandboxProjection<'_>>,
-    ) -> PersistenceResult<WriteResult> {
-        store_dispatch_traced!(self.put_if_with_operation(
+        sandbox_projection: &AtomicSandboxProjection<'_>,
+        operation: Option<&crate::storage_proto::StoredConfigUpdateOperation>,
+    ) -> PersistenceResult<openshell_core::proto::Sandbox> {
+        store_dispatch_traced!(self.put_sandbox_settings_atomic(
             object_type,
             id,
             name,
             workspace,
             payload,
             condition,
-            operation,
-            sandbox_projection
+            sandbox_projection,
+            operation
         ))
     }
 
@@ -547,18 +618,6 @@ impl Store {
         let mut updated = operation.clone();
         updated.set_resource_version(resource_version);
         Ok(KnownVersionUpdate::Changed(updated))
-    }
-
-    /// Repair operation query columns from the authoritative protobuf payload
-    /// without changing the payload or resource version.
-    pub async fn repair_config_operation_projection(
-        &self,
-        operation: &crate::storage_proto::StoredConfigUpdateOperation,
-        expected_resource_version: u64,
-    ) -> PersistenceResult<bool> {
-        store_dispatch!(
-            self.repair_config_operation_projection(operation, expected_resource_version)
-        )
     }
 
     /// Return pending operations for one sandbox. Terminal history is excluded

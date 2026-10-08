@@ -847,9 +847,6 @@ pub(crate) async fn run_server(
     grpc::policy::backfill_legacy_policy_history(&state)
         .await
         .map_err(|error| Error::execution(error.to_string()))?;
-    config_update_operation::repair_query_projections(&state)
-        .await
-        .map_err(|error| Error::execution(error.to_string()))?;
 
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped

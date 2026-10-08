@@ -477,7 +477,7 @@ fn decode_request_message(name: &str, request: &impl Message) -> Result<DynamicM
         .map_err(|_| Status::internal("decode mutation request"))
 }
 
-pub(super) fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
+fn fingerprint<M: Mutation>(request: &M) -> Result<String, Status> {
     let mut message = request.canonical_message()?;
     message.clear_field_by_name("request_id");
     if M::METHOD == "UpdateConfig" {

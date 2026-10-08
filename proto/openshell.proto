@@ -2792,18 +2792,20 @@ message UpdateConfigRequest {
   map<string, string> annotations = 9;
   // Controls whether the RPC returns after commit or after the runtime reaches
   // a terminal outcome, including failure, supersession, cancellation or inactivity.
-  // Unspecified preserves commit-only compatibility.
+  // Unspecified preserves commit-only compatibility. A gateway that does not
+  // track completion, for example because supervisors poll for configuration,
+  // returns the committed result without an operation.
   ConfigUpdateWaitMode wait_mode = 12;
-  // Optional retry key scoped to the sandbox. Reusing a key returns the
-  // original operation and never creates another desired-state revision.
-  string idempotency_key = 13;
   // Server-side wait bound for WAIT_FOR_COMPLETION. Zero uses 60 seconds. The
   // operation remains durable and may complete after this RPC times out.
-  google.protobuf.Duration wait_timeout = 14;
+  google.protobuf.Duration wait_timeout = 13;
   // Required for sandbox-scoped updates and empty for global updates.
   string sandbox = 1;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
+  // wait_mode and wait_timeout are not part of the admitted request: a retry
+  // with the same request_id replays the committed result, including its
+  // operation, and WAIT_FOR_COMPLETION waits again on that operation.
   string request_id = 11;
 }
 

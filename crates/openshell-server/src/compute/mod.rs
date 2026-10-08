@@ -5368,6 +5368,16 @@ impl ComputeRuntime {
                 .map_err(|e| format!("delete {label}: {e}"))?;
         }
 
+        // Sandbox configuration operations are scoped to the sandbox. Provider
+        // receipts are not: mutation replay restores them after it is gone.
+        self.store
+            .delete_by_scope(
+                crate::config_update_operation::CONFIG_UPDATE_OPERATION_OBJECT_TYPE,
+                sandbox.object_id(),
+            )
+            .await
+            .map_err(|e| format!("delete configuration update operations: {e}"))?;
+
         Ok(())
     }
 
@@ -18570,5 +18580,63 @@ mod tests {
             .unwrap();
         assert_eq!(starting.object_id(), "sb-ttl");
         assert_eq!(starting.phase(), i32::from(SandboxPhase::Starting));
+    }
+
+    #[tokio::test]
+    async fn sandbox_delete_removes_configuration_operations_but_keeps_provider_receipts() {
+        use crate::config_update_operation::{
+            CONFIG_UPDATE_OPERATION_OBJECT_TYPE, OperationTarget,
+        };
+
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver).await;
+        let sandbox = sandbox_record("sb-operations", "sandbox-operations", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let operation = crate::config_update_operation::new_record(
+            &sandbox,
+            OperationTarget::SettingsRevision(1),
+        );
+        runtime
+            .store
+            .insert_existing_config_operation(&operation)
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put_if(
+                CONFIG_UPDATE_OPERATION_OBJECT_TYPE,
+                "provider-receipt",
+                "provider-receipt",
+                "default",
+                b"receipt",
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .delete_sandbox("default", "sandbox-operations")
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .get(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, operation.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .get(CONFIG_UPDATE_OPERATION_OBJECT_TYPE, "provider-receipt")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

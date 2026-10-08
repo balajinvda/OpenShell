@@ -190,7 +190,6 @@ func ConfigUpdateToProto(cu *v1.ConfigUpdate) (*pb.UpdateConfigRequest, error) {
 		Global:                  cu.Global,
 		ExpectedResourceVersion: cu.ExpectedResourceVersion,
 		Annotations:             CopyStringMap(cu.Annotations),
-		IdempotencyKey:          cu.IdempotencyKey,
 		WaitTimeout:             durationpb.New(time.Duration(cu.WaitTimeoutSeconds) * time.Second),
 	}
 	switch cu.WaitMode {

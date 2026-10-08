@@ -105,9 +105,10 @@ type ConfigUpdate struct {
 	// Annotations is caller-provided metadata for sandbox-scoped updates.
 	Annotations map[string]string
 	// WaitMode controls whether Update returns after commit or completion.
+	// A gateway that does not track completion, for example because
+	// supervisors poll for configuration, returns the committed result with
+	// a nil Operation.
 	WaitMode ConfigUpdateWaitMode
-	// IdempotencyKey maps retries to the original durable operation.
-	IdempotencyKey string
 	// WaitTimeoutSeconds bounds WaitForCompletion on the server. Zero uses the server default.
 	WaitTimeoutSeconds uint32
 }
@@ -144,6 +145,7 @@ type ConfigUpdateResult struct {
 	Deleted bool
 	// Annotations contains sandbox metadata annotations after the update.
 	Annotations map[string]string
-	// Operation is present for sandbox-scoped requests, including unchanged values.
+	// Operation is present for sandbox-scoped requests, including unchanged
+	// values, when the gateway tracks their completion. It is nil otherwise.
 	Operation *ConfigUpdateOperation
 }
