@@ -3,6 +3,36 @@
 This crate implements the supervisor-side isolation backend and the private
 control protocol shared with `openshell-sandbox`.
 
+## Boundary startup and routing
+
+The supervisor uses the generated `IsolationBackend` control service to
+negotiate capabilities and open a boundary before reading image policy. Each
+physical connection repeats that handshake, including credential-epoch changes
+and transport recovery. The launch session ID is the stable opening request ID;
+retries preserve the descriptor and return the same handle for the runtime's
+lifetime. Driver deletion terminates the runtime and invalidates that handle.
+
+Protocol 1.0 requires `openshell.isolation.contract` and
+`openshell.isolation.boundary-routing` on both peers. The shared extension
+negotiator checks major versions and each peer's required capabilities. The
+built-in runtime does not advertise `openshell.isolation.suspend-resume` and
+returns `UNIMPLEMENTED` for those optional RPCs.
+
+`DelegatedIsolationBoundary.Exchange` and `.Mediate` begin with the handle from
+`OpenBoundary`. The server authenticates the stream's bearer, checks the handle
+against its provisioned sandbox and generation, then accepts data fragments.
+Missing bindings, repeated bindings, and frames without a payload are rejected.
+The fragments retain the existing versioned Sandbox Protocol framing.
+
+Opening a boundary only validates and reserves a route. It neither attaches a
+supervisor nor runs workload code. Policy discovery is followed by the existing
+attach, mediation setup, confirm, and explicit start sequence. The existing
+connection registry continues to govern supervisor replacement and recovery.
+
+The legacy `IsolationBoundary` schema remains available to generated clients,
+but current runtimes do not serve it. Update the supervisor and sandbox runtime
+together; an older peer fails during startup instead of using a fallback path.
+
 ## Exec recovery
 
 An exec envelope carries a UUID request ID and an absolute expiration time in

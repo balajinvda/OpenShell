@@ -9,10 +9,12 @@
 //! types in this crate.
 
 pub mod boundary_protocol;
+pub mod isolation_protocol;
 pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
 
+pub use openshell_core::proto::isolation::backend::v1 as isolation_proto;
 pub use runtime::OpenShellRuntimeBackend;
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.

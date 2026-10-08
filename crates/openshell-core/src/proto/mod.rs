@@ -44,6 +44,12 @@ pub mod extension {
     pub use super::generated::openshell::extension::v1;
 }
 
+pub mod isolation {
+    pub mod backend {
+        pub use super::super::generated::openshell::isolation::backend::v1;
+    }
+}
+
 #[allow(
     clippy::all,
     clippy::pedantic,

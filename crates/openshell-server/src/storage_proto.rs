@@ -513,11 +513,21 @@ mod tests {
         let mut methods = Vec::new();
         let mut public_roots = BTreeSet::new();
         let mut compiled_method_count = 0;
+        let mut isolation_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
+                if package == "openshell.isolation.backend.v1" {
+                    assert_eq!(service_name, "IsolationBackend");
+                    isolation_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("isolation method name")),
+                    );
+                }
                 if !matches!(
                     (package, service_name),
                     ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
@@ -541,6 +551,15 @@ mod tests {
             }
         }
         methods.sort();
+        assert_eq!(
+            isolation_methods,
+            BTreeSet::from([
+                "GetCapabilities",
+                "OpenBoundary",
+                "ResumeBoundary",
+                "SuspendBoundary"
+            ])
+        );
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -555,7 +574,9 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            102 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+                + PEER_OWNER_RPC_SIGNATURES.len()
+                + isolation_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(

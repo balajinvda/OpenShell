@@ -155,7 +155,31 @@ pub fn negotiate(
     extension: Option<PeerMetadata>,
 ) -> Result<NegotiatedExtension, NegotiationError> {
     let configured_name = configured_name.into();
-    let family_name = family.as_str();
+    let metadata = negotiate_metadata(family.as_str(), &configured_name, gateway, extension)?;
+    let version = metadata
+        .protocol_version
+        .expect("validated protocol version");
+    Ok(NegotiatedExtension {
+        family,
+        configured_name,
+        implementation_name: metadata.implementation_name,
+        implementation_version: metadata.implementation_version,
+        protocol_major: version.major,
+        protocol_minor: version.minor,
+        supported_capabilities: metadata.supported_capabilities,
+        required_capabilities: metadata.required_capabilities,
+    })
+}
+
+/// Validate a versioned peer contract, including families owned by the supervisor.
+/// Both peers must advertise every capability required by the other peer.
+pub fn negotiate_metadata(
+    family_name: &'static str,
+    configured_name: impl Into<String>,
+    gateway: &PeerMetadata,
+    extension: Option<PeerMetadata>,
+) -> Result<PeerMetadata, NegotiationError> {
+    let configured_name = configured_name.into();
     let extension = extension.ok_or_else(|| NegotiationError::MissingMetadata {
         family: family_name,
         name: configured_name.clone(),
@@ -245,13 +269,10 @@ pub fn negotiate(
         });
     }
 
-    Ok(NegotiatedExtension {
-        family,
-        configured_name,
+    Ok(PeerMetadata {
+        protocol_version: Some(*version),
         implementation_name: extension.implementation_name,
         implementation_version: extension.implementation_version,
-        protocol_major: version.major,
-        protocol_minor: version.minor,
         supported_capabilities: extension_supported.into_iter().collect(),
         required_capabilities: extension_required.into_iter().collect(),
     })

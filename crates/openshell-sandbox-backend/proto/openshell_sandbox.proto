@@ -5,9 +5,10 @@ syntax = "proto3";
 
 package openshell.sandbox.protocol.v1;
 
-// IsolationBoundary multiplexes the OpenShell Sandbox Protocol
+// Legacy IsolationBoundary multiplexes the OpenShell Sandbox Protocol
 // over one authenticated gRPC connection. Each Exchange call is an independent
-// HTTP/2 stream; Mediate is the persistent DNS exchange channel.
+// HTTP/2 stream; Mediate is the persistent DNS exchange channel. Retained for
+// schema compatibility; current runtimes serve DelegatedIsolationBoundary.
 service IsolationBoundary {
   rpc Exchange(stream BoundaryChunk) returns (stream BoundaryChunk);
   rpc Mediate(stream BoundaryChunk) returns (stream BoundaryChunk);
@@ -19,11 +20,11 @@ message BoundaryChunk {
   bytes data = 1;
 }
 
-// Draft stream entrypoint for a shared out-of-process Isolation Backend.
+// Stream entrypoint for per-boundary or shared out-of-process Isolation Backends.
 // Each client stream starts with a boundary_id frame. The backend checks that
 // handle against the authenticated sandbox and generation before accepting any
 // data. Subsequent data fragments carry the existing Sandbox Protocol bytes.
-// This service does not change the first-party IsolationBoundary RPCs.
+// OpenBoundary returns the handle before policy discovery and lifecycle traffic.
 service DelegatedIsolationBoundary {
   rpc Exchange(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
   rpc Mediate(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
@@ -31,7 +32,7 @@ service DelegatedIsolationBoundary {
 
 message DelegatedBoundaryChunk {
   oneof payload {
-    // Required as the first client frame; forbidden on later frames.
+    // Nonempty handle required as the first client frame; forbidden on later frames.
     string boundary_id = 1;
     // Ordered fragment of the existing Sandbox Protocol. Response frames only
     // use data. Empty data is allowed and does not bind a stream.

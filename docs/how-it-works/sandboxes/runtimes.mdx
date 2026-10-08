@@ -44,6 +44,11 @@ driver TOML overrides the compiled release defaults. Helm renders Kubernetes
 image fields into TOML, so they apply when these environment variables are
 unset. Sandbox requests cannot override either trusted image.
 
+Use supervisor and sandbox-runtime images from the same release. The supervisor
+checks their isolation protocol version and required capabilities before
+starting workload code. An incompatible pair fails sandbox startup; update
+both trusted images together when overriding the release defaults.
+
 When building your own gateway or supervisor image, the `GATEWAY_BASE_IMAGE`
 and `SUPERVISOR_BASE_IMAGE` build arguments override their pinned bases. See
 [Container Image Base Overrides](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#container-image-base-overrides)
