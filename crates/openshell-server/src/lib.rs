@@ -694,6 +694,7 @@ pub(crate) async fn run_server(
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
+        Duration::from_secs(config.provider_profile_source_refresh_interval_secs),
     )
     .map_err(|err| {
         Error::config(format!(
@@ -704,6 +705,8 @@ pub(crate) async fn run_server(
         sources = ?provider_profile_sources.source_ids(),
         "provider profile sources configured"
     );
+    // Builds read cached interceptor snapshots, so fetch them before serving.
+    provider_profile_sources.refresh_cached(&store).await;
     let mut state = ServerState::new_with_credentials(
         config.clone(),
         store.clone(),
@@ -985,6 +988,7 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     config_delivery::spawn_owner_reconciler(state.clone(), Duration::from_secs(30));
+    provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;

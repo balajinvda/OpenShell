@@ -20,6 +20,9 @@ use std::time::Duration;
 // reference these constants instead of hardcoding literals.
 
 /// Default SSH port inside sandbox containers.
+/// Default refresh interval for interceptor provider-profile sources. Matches
+/// the supervisor configuration poll interval.
+pub const DEFAULT_PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_SSH_PORT: u16 = 2222;
 
 /// Default gateway server port.
@@ -257,6 +260,10 @@ pub struct Config {
 
     /// Ordered provider-profile sources used to build the effective catalog.
     pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
+
+    /// How often interceptor provider-profile sources are re-fetched. Reads
+    /// use the cached snapshot and fail closed once it is three intervals old.
+    pub provider_profile_source_refresh_interval_secs: u64,
 
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
@@ -916,6 +923,8 @@ impl Config {
             enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
+            provider_profile_source_refresh_interval_secs:
+                DEFAULT_PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL_SECS,
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),

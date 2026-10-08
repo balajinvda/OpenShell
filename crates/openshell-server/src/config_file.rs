@@ -163,6 +163,9 @@ pub struct GatewayFileSection {
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
     pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
+    /// Seconds between refreshes of interceptor provider-profile sources.
+    #[serde(default)]
+    pub provider_profile_source_refresh_interval_seconds: Option<u64>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]

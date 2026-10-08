@@ -1171,6 +1171,7 @@ pub mod test_support {
         crate::provider_profile_sources::ProviderProfileSources::from_config(
             &[openshell_core::GatewayProviderProfileSourceConfig::User],
             None,
+            std::time::Duration::from_secs(10),
         )
         .expect("user-only provider profile source configuration should be valid")
     }

@@ -533,6 +533,18 @@ fn prepare_server_config_with_drivers(
     {
         config = config.with_provider_profile_sources(sources);
     }
+    if let Some(seconds) = file.as_ref().and_then(|file| {
+        file.openshell
+            .gateway
+            .provider_profile_source_refresh_interval_seconds
+    }) {
+        if seconds == 0 {
+            return Err(miette::miette!(
+                "provider_profile_source_refresh_interval_seconds must be greater than zero"
+            ));
+        }
+        config.provider_profile_source_refresh_interval_secs = seconds;
+    }
 
     if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
         if let Some(drivers) = &gateway_file.credential_drivers {
