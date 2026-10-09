@@ -401,6 +401,9 @@ host probes return to `target/windows-remote-results`, including nonzero test
 outcomes. The remote host needs SSH, OpenSSL, and MXC, not a compiler toolchain.
 Package the matching `libz3.dll` from the target-specific Cargo cache alongside
 the gateway: Windows prebuilt Z3 uses an import library, not static linkage.
+The `windows:build:*` tasks now stage the pinned DLL, check PE architecture,
+reject conflicting cache hashes, and verify the copied hash. Local MXC E2E
+requires the adjacent DLL and reports a preflight error if it is missing.
 Use `-Z3DllPath` when discovery is ambiguous. The native Visual C++ runtime
 must be present on the remote host. Verify DLL architecture and the gateway
 loader before E2E; do not count missing-DLL crashes as MXC enforcement failures.

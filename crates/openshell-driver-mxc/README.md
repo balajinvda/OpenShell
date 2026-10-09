@@ -176,6 +176,12 @@ drivers need no UI-specific handling. UI policy itself does not require the
 
 ## Validation
 
+Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
+the gateway and verify its architecture and copied SHA256. Conflicting cached
+DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
+this adjacent DLL; rebuild for the native architecture if preflight reports it
+missing.
+
 ### Remote Windows host
 
 Build on a Windows MSVC development machine and run the unchanged real E2E
