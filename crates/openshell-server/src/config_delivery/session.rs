@@ -167,6 +167,9 @@ struct ComponentDeliveryState {
     /// rebuild that races the bootstrap waits as `pending`, so it is dropped
     /// if the bootstrap result acknowledges the same snapshot.
     awaiting_bootstrap_since: Option<Instant>,
+    /// The supervisor failed to apply the last update it finished.
+    /// Reconciliation rebuilds the component until an update succeeds.
+    rejected: bool,
 }
 
 #[derive(Debug)]
@@ -336,6 +339,7 @@ impl ConfigSessionState {
         }
         let staged = completed.outcome == ConfigApplyOutcome::AwaitingComponent;
         delivery_state.staged = staged;
+        delivery_state.rejected = outcome_rejects_revision(completed.outcome);
         delivery_state.in_flight = None;
         let pending = delivery_state.pending.take();
 
@@ -395,6 +399,13 @@ impl ConfigSessionState {
         }
         let pending = delivery_state.pending.take();
         self.release_pending(component, pending)
+    }
+
+    fn rejected_components(&self) -> ConfigComponents {
+        ConfigComponents {
+            sandbox_config: self.sandbox_config.rejected,
+            provider_environment: self.provider_environment.rejected,
+        }
     }
 
     fn acknowledge_bootstrap(
@@ -533,6 +544,20 @@ impl SupervisorSessionRegistry {
         acknowledged
     }
 
+    /// Components whose last update the session's supervisor failed to
+    /// apply.
+    pub(crate) fn rejected_config_components(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> ConfigComponents {
+        self.with_config_session(sandbox_id, session_id, |config| {
+            config.map(|config| config.rejected_components())
+        })
+        .flatten()
+        .unwrap_or_default()
+    }
+
     /// Hold configuration updates for a session until its bootstrap result
     /// arrives.
     pub(crate) fn await_config_bootstrap(&self, sandbox_id: &str, session_id: &str) {
@@ -622,6 +647,13 @@ fn validate_component_apply_result(
         ));
     }
     Ok(outcome)
+}
+
+fn outcome_rejects_revision(outcome: ConfigApplyOutcome) -> bool {
+    matches!(
+        outcome,
+        ConfigApplyOutcome::FailedRetainedLastKnownGood | ConfigApplyOutcome::FailedClosed
+    )
 }
 
 fn outcome_acknowledges_revision(outcome: ConfigApplyOutcome) -> bool {
@@ -2312,8 +2344,12 @@ mod tests {
                     result: Some(ConfigComponentApplyResult {
                         component: ConfigComponent::from(message.component()).into(),
                         requested_revision: Some(revision.clone()),
-                        applied_revision: (outcome != ConfigApplyOutcome::AwaitingComponent)
-                            .then_some(revision),
+                        applied_revision: (!matches!(
+                            outcome,
+                            ConfigApplyOutcome::AwaitingComponent
+                                | ConfigApplyOutcome::FailedClosed
+                        ))
+                        .then_some(revision),
                         outcome: outcome.into(),
                         ..Default::default()
                     }),
@@ -2322,6 +2358,45 @@ mod tests {
             )
             .unwrap();
         registry.finalize_config_update("sb-1", "session-1", &completed, true)
+    }
+
+    #[test]
+    fn rejected_components_stay_eligible_for_reconciliation_until_applied() {
+        let registry = SupervisorSessionRegistry::new();
+        let slots = register_apply_session(&registry, "sb-1", "session-1");
+        let provider = SupervisorConfigMessage::ProviderEnvironment(ProviderEnvironmentSnapshot {
+            provider_env_revision: 5,
+            ..Default::default()
+        });
+        let rejected = || registry.rejected_config_components("sb-1", "session-1");
+        let send = || {
+            assert_eq!(
+                registry.deliver_config("sb-1", "session-1", provider.clone()),
+                DeliveryDisposition::Queued
+            );
+            sent_update(slots.take_for_test().expect("delivered update"))
+        };
+
+        let update = send();
+        finalize_result(
+            &registry,
+            &update,
+            &provider,
+            ConfigApplyOutcome::FailedClosed,
+        );
+        assert_eq!(
+            rejected(),
+            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment)
+        );
+
+        // The failed snapshot was never acknowledged, so a rebuild resends it.
+        let update = send();
+        finalize_result(&registry, &update, &provider, ConfigApplyOutcome::Applied);
+        assert_eq!(rejected(), ConfigComponents::default());
+        assert_eq!(
+            registry.rejected_config_components("sb-1", "other-session"),
+            ConfigComponents::default()
+        );
     }
 
     #[test]

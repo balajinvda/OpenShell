@@ -419,6 +419,12 @@ impl Deliver for Builder<'_> {
         }
         (failed, providers)
     }
+
+    fn rejected(&self, record: &SessionRecord) -> ConfigComponents {
+        self.0
+            .supervisor_sessions
+            .rejected_config_components(&record.sandbox_id, &record.session_id)
+    }
 }
 
 enum BuildResult {

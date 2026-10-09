@@ -23,8 +23,9 @@ use tokio::time::Instant;
 
 use super::ConfigComponents;
 
-/// How often a session rebuilds its sandbox configuration to repair a missed
-/// publication. A session first reconciles one to two intervals after it
+/// How often a session rebuilds its sandbox configuration, and any component
+/// its supervisor failed to apply, to repair a missed publication or retry a
+/// failure that may have cleared. A session first reconciles one to two intervals after it
 /// registers, at a random offset, so reconciliation is a steady trickle
 /// rather than a burst and never repeats the bootstrap it just applied.
 pub(super) const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
@@ -269,10 +270,13 @@ pub(super) trait Deliver: Sync {
         record: &SessionRecord,
         work: Work,
     ) -> impl Future<Output = (ConfigComponents, Option<HashSet<String>>)> + Send;
+
+    /// Components whose last update the session's supervisor failed to apply.
+    fn rejected(&self, record: &SessionRecord) -> ConfigComponents;
 }
 
 /// Run a session's deliveries until it closes, rebuilding its sandbox
-/// configuration every `reconcile_interval` to repair missed publications.
+/// configuration and any rejected component every `reconcile_interval`.
 pub(super) async fn run(
     record: Arc<SessionRecord>,
     permits: &Permits,
@@ -292,7 +296,8 @@ pub(super) async fn run(
                 () = record.wake.notified() => {}
                 () = tokio::time::sleep_until(next_reconcile) => {
                     next_reconcile = Instant::now() + reconcile_interval;
-                    record.mark(ConfigComponents::SANDBOX_CONFIG, Lane::Fanout);
+                    let components = ConfigComponents::SANDBOX_CONFIG.union(deliver.rejected(&record));
+                    record.mark(components, Lane::Fanout);
                 }
             }
         }
@@ -381,11 +386,13 @@ mod tests {
         }))
     }
 
-    /// Records each delivery and fails the components in `fail`.
+    /// Records each delivery and fails the components in `fail`. Reports the
+    /// components in `rejected` as rejected by the supervisor.
     #[derive(Default)]
     struct Recorder {
         delivered: Mutex<Vec<Work>>,
         fail: Mutex<ConfigComponents>,
+        rejected: Mutex<ConfigComponents>,
         gate: Option<Arc<Semaphore>>,
         calls: AtomicUsize,
     }
@@ -402,6 +409,10 @@ mod tests {
             }
             self.delivered.lock().unwrap().push(work);
             (*self.fail.lock().unwrap(), None)
+        }
+
+        fn rejected(&self, _record: &SessionRecord) -> ConfigComponents {
+            *self.rejected.lock().unwrap()
         }
     }
 
@@ -618,6 +629,45 @@ mod tests {
         tokio::time::advance(RECONCILE_INTERVAL).await;
         settle().await;
         assert_eq!(recorder.delivered().len(), 2);
+
+        session.close();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_retries_rejected_components() {
+        let permits = Permits::new(4);
+        let recorder = Arc::new(Recorder::default());
+        *recorder.rejected.lock().unwrap() =
+            ConfigComponents::only(ConfigComponentKind::ProviderEnvironment);
+        let session = record("sb", "ws", &[]);
+        let task = tokio::spawn({
+            let session = Arc::clone(&session);
+            let recorder = Arc::clone(&recorder);
+            async move { run(session, &permits, recorder.as_ref(), RECONCILE_INTERVAL).await }
+        });
+        settle().await;
+
+        tokio::time::advance(RECONCILE_INTERVAL * 2).await;
+        settle().await;
+        assert_eq!(
+            recorder.delivered(),
+            [Work {
+                components: ConfigComponents::ALL,
+                lane: Lane::Fanout
+            }]
+        );
+
+        *recorder.rejected.lock().unwrap() = ConfigComponents::default();
+        tokio::time::advance(RECONCILE_INTERVAL).await;
+        settle().await;
+        assert_eq!(
+            recorder.delivered()[1],
+            Work {
+                components: ConfigComponents::SANDBOX_CONFIG,
+                lane: Lane::Fanout
+            }
+        );
 
         session.close();
         task.await.unwrap();
