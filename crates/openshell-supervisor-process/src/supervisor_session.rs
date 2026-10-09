@@ -87,6 +87,9 @@ pub struct PreparedSupervisorSession {
     session_id: String,
     /// The gateway committed to authoritative streamed configuration.
     config_apply_enabled: bool,
+    /// The hello reported the workload as not started, so a polling gateway
+    /// waits for `SupervisorRuntimeReady`.
+    workload_pending: bool,
     bootstrap: Option<ConfigBootstrap>,
 }
 
@@ -1057,6 +1060,7 @@ async fn open_session(
             heartbeat_secs,
             session_id: accepted.session_id,
             config_apply_enabled,
+            workload_pending,
             bootstrap: config_apply_enabled.then_some(accepted.bootstrap).flatten(),
         },
     )))
@@ -1099,8 +1103,10 @@ async fn run_prepared_session(
     if !prepared.config_apply_enabled {
         config.ready_tx.send_replace(true);
         // Without streamed admission the gateway learns readiness only from
-        // this report. A reconnect after the runtime started repeats it.
-        if config.runtime_ready.load(Ordering::Acquire) {
+        // this report. A hello that reported the workload running was already
+        // ready on accept; one sent while it was pending needs the report if
+        // the workload started before the session was accepted.
+        if prepared.workload_pending && config.runtime_ready.load(Ordering::Acquire) {
             tx.send(SupervisorMessage {
                 payload: Some(supervisor_message::Payload::RuntimeReady(
                     openshell_core::proto::SupervisorRuntimeReady {},
